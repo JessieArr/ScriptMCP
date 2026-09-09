@@ -1,0 +1,16 @@
+export default {
+  name: "echo",
+  description: "Return the provided JSON payload unchanged.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      value: {
+        description: "Any JSON value to echo back",
+      },
+    },
+    required: ["value"],
+  },
+  run({ value }: { value: unknown }): unknown {
+    return { echoed: value };
+  },
+};

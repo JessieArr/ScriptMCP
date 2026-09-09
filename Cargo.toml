@@ -1,0 +1,35 @@
+[package]
+name = "scriptmcp"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "MCP frontend that exposes Deno scripts as tools"
+authors = ["Jessie Arr"]
+readme = "README.md"
+keywords = ["mcp", "deno", "tools"]
+categories = ["command-line-utilities"]
+repository = "https://github.com/JessieArr/ScriptMCP"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "json"] }
+clap = { version = "4", features = ["derive", "env"] }
+eframe = { version = "0.33.3", features = ["default"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "json", "rustls"] }
+rfd = "0.17.2"
+rmcp = { version = "3.2", features = ["server", "transport-io", "transport-streamable-http-server"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11.0"
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
