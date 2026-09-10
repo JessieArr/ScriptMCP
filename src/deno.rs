@@ -1,10 +1,11 @@
+use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
 use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -13,9 +14,21 @@ use tracing::debug;
 
 use crate::catalog::ScriptMeta;
 use crate::config::Opts;
-use crate::permissions::to_deno_flags;
+use crate::permissions::{to_deno_flags, ScriptPermissions};
 
 const HOST_TS: &str = include_str!("../runtime/host.ts");
+
+/// A user script threw or rejected during invoke/introspect.
+#[derive(Debug)]
+pub struct ScriptError(pub String);
+
+impl fmt::Display for ScriptError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ScriptError {}
 
 #[derive(Debug, Clone)]
 pub struct DenoRuntime {
@@ -24,22 +37,16 @@ pub struct DenoRuntime {
     allow_all: bool,
     extra_args: Vec<String>,
     timeout: Duration,
-    scripts_dir: PathBuf,
-}
-
-#[derive(Debug, Deserialize)]
-struct HostEnvelope {
-    ok: Option<bool>,
-    result: Option<Value>,
-    error: Option<String>,
+    scripts_dir: Arc<RwLock<PathBuf>>,
 }
 
 impl DenoRuntime {
     pub async fn new(opts: &Opts) -> Result<Self> {
-        let scripts_dir = opts
-            .scripts
-            .canonicalize()
-            .with_context(|| format!("scripts directory not found: {}", opts.scripts.display()))?;
+        let scripts_dir = crate::catalog::resolve_scripts_dir(&opts.scripts)?;
+        Self::from_shared_dir(opts, Arc::new(RwLock::new(scripts_dir))).await
+    }
+
+    pub async fn from_shared_dir(opts: &Opts, scripts_dir: Arc<RwLock<PathBuf>>) -> Result<Self> {
         let deno = crate::install::resolve_deno(&opts.deno);
         check_deno(&deno).await?;
         let host = write_host_script()?;
@@ -55,7 +62,7 @@ impl DenoRuntime {
 
     pub async fn introspect(&self, script: &Path) -> Result<ScriptMeta> {
         let output = self
-            .run_host("introspect", script, &[], None)
+            .run_host("introspect", script, &ScriptPermissions::default(), None)
             .await
             .with_context(|| format!("introspect {}", script.display()))?;
         let meta: ScriptMeta = serde_json::from_value(output)
@@ -66,47 +73,38 @@ impl DenoRuntime {
     pub async fn invoke(
         &self,
         script: &Path,
-        permissions: &[String],
+        permissions: &ScriptPermissions,
         arguments: &Value,
     ) -> Result<Value> {
         let payload = serde_json::to_vec(arguments)?;
         let output = self
             .run_host("invoke", script, permissions, Some(&payload))
-            .await
-            .with_context(|| format!("invoke {}", script.display()))?;
-
-        let envelope: HostEnvelope =
-            serde_json::from_value(output.clone()).unwrap_or(HostEnvelope {
-                ok: Some(true),
-                result: Some(output),
-                error: None,
-            });
-
-        if envelope.ok == Some(false) {
-            bail!(
-                "{}",
-                envelope
-                    .error
-                    .unwrap_or_else(|| "script returned an error".into())
-            );
+            .await?;
+        if output.get("ok").and_then(Value::as_bool) == Some(true) {
+            return Ok(output.get("result").cloned().unwrap_or(Value::Null));
         }
-        Ok(envelope.result.unwrap_or(Value::Null))
+        Ok(output)
     }
 
     async fn run_host(
         &self,
         command: &str,
         script: &Path,
-        permissions: &[String],
+        permissions: &ScriptPermissions,
         stdin: Option<&[u8]>,
     ) -> Result<Value> {
+        let workspace = self
+            .scripts_dir
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let mut cmd = Command::new(&self.deno);
         cmd.arg("run")
             .arg("--no-prompt")
             .arg("--quiet")
             .args(self.base_permissions())
             .args(self.extra_args.iter())
-            .args(to_deno_flags(permissions))
+            .args(to_deno_flags(permissions, &workspace))
             .arg(&self.host)
             .arg(command)
             .arg(script)
@@ -154,11 +152,7 @@ impl DenoRuntime {
         match parse_host_json(&stdout) {
             Ok(value) => {
                 if let Some(false) = value.get("ok").and_then(Value::as_bool) {
-                    let error = value
-                        .get("error")
-                        .and_then(Value::as_str)
-                        .unwrap_or("script failed");
-                    bail!("{error}");
+                    bail!(ScriptError(format_host_error(value.get("error"))));
                 }
                 Ok(value)
             }
@@ -182,7 +176,13 @@ impl DenoRuntime {
             return vec!["--allow-all".to_string()];
         }
         vec![
-            format!("--allow-read={}", self.scripts_dir.display()),
+            format!(
+                "--allow-read={}",
+                self.scripts_dir
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .display()
+            ),
             format!("--allow-read={}", self.host.display()),
         ]
     }
@@ -222,6 +222,33 @@ fn write_host_script() -> Result<PathBuf> {
     Ok(path)
 }
 
+fn format_host_error(error: Option<&Value>) -> String {
+    let Some(error) = error else {
+        return "script failed".into();
+    };
+    if let Some(text) = error.as_str() {
+        return text.to_string();
+    }
+    let Some(object) = error.as_object() else {
+        return error.to_string();
+    };
+    let name = object
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let message = object
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match (name, message) {
+        ("", "") => "script failed".into(),
+        ("", message) => message.to_string(),
+        (name, "") => name.to_string(),
+        (name, message) if message.starts_with(name) => message.to_string(),
+        (name, message) => format!("{name}: {message}"),
+    }
+}
+
 fn parse_host_json(stdout: &str) -> Result<Value> {
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
@@ -253,5 +280,21 @@ mod tests {
             parse_host_json(raw).unwrap(),
             json!({"ok": true, "result": 1})
         );
+    }
+
+    #[test]
+    fn formats_structured_and_string_host_errors() {
+        assert_eq!(
+            format_host_error(Some(&json!({
+                "name": "TypeError",
+                "message": "x is not a function"
+            }))),
+            "TypeError: x is not a function"
+        );
+        assert_eq!(
+            format_host_error(Some(&json!("plain failure"))),
+            "plain failure"
+        );
+        assert_eq!(format_host_error(None), "script failed");
     }
 }

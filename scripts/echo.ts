@@ -10,7 +10,13 @@ export default {
     },
     required: ["value"],
   },
-  run({ value }: { value: unknown }): unknown {
-    return { echoed: value };
+  annotations: {
+    readOnlyHint: true,
+    idempotentHint: true,
+  },
+  async run(args: { value: unknown }) {
+    return {
+      result: args.value,
+    };
   },
 };

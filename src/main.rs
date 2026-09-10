@@ -74,7 +74,7 @@ async fn list_tools(opts: &Opts) -> Result<()> {
     use scriptmcp::deno::DenoRuntime;
 
     let runtime = DenoRuntime::new(opts).await?;
-    let catalog = Catalog::load(opts, &runtime).await?;
+    let catalog = Catalog::load(&opts.scripts, &runtime).await?;
     if catalog.tools().is_empty() {
         println!("No scripts found in {}", opts.scripts.display());
         return Ok(());

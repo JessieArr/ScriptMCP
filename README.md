@@ -32,6 +32,8 @@ MCP has more than one way to talk to a server:
 
 There is also a legacy HTTP+SSE transport in the protocol. ScriptMCP does not implement that; HTTP here is Streamable HTTP on `/mcp`.
 
+The server watches the scripts directory. Adding, editing, or removing a tool file (or choosing a new scripts folder in the UI) reloads the catalog and sends `notifications/tools/list_changed` so clients can refresh schemas.
+
 The default HTTP bind is loopback only (`127.0.0.1:8788`). Override with `--bind` or `SCRIPTMCP_BIND`.
 
 ## Run
@@ -93,41 +95,83 @@ The executable is `target/release/scriptmcp`. After `scriptmcp install-deno` (or
 
 ## Writing a tool
 
-Drop a `.ts` or `.js` file in the scripts directory. Files that start with `_` or `.` are ignored.
-
-Named exports:
-
-```ts
-export const name = "hello";
-export const description = "Greet someone by name.";
-export const inputSchema = {
-  type: "object",
-  properties: {
-    name: { type: "string", description: "Name to greet" },
-  },
-  required: ["name"],
-};
-export const permissions = ["net"];
-
-export default function hello({ name }: { name: string }): string {
-  return `Hello, ${name}!`;
-}
-```
-
-Or a default object:
+Each MCP tool is a TypeScript (or JavaScript) module that **default-exports a plain object**. Files that start with `_` or `.` are ignored. The script has no dependency on an MCP SDK.
 
 ```ts
 export default {
-  name: "hello",
-  description: "Greet someone by name.",
-  inputSchema: { type: "object", properties: { name: { type: "string" } }, required: ["name"] },
-  run({ name }: { name: string }) {
-    return `Hello, ${name}!`;
+  name: "tool_name",
+
+  description:
+    "Describe what this tool does and when the LLM should use it.",
+
+  inputSchema: {
+    type: "object",
+    properties: {
+      value: {
+        type: "string",
+        description: "Description of this argument",
+      },
+    },
+    required: ["value"],
+  },
+
+  permissions: {
+    read: { allow: [], deny: [] },
+    write: { allow: [], deny: [] },
+    net: { allow: [], deny: [] },
+    env: { allow: [], deny: [] },
+    run: { allow: [], deny: [] },
+    sys: { allow: [], deny: [] },
+  },
+
+  async run(args) {
+    return {
+      result: args.value,
+    };
   },
 };
 ```
 
-`name` defaults to the file stem. `run` may be async. A string return becomes MCP text content; any other JSON value is returned as structured content.
+### Supported fields
+
+```ts
+export default {
+  // Required
+  name: string,
+  description: string,
+  run: async (args) => any,
+
+  // Optional
+  inputSchema?: JSONSchema,
+  outputSchema?: JSONSchema,
+
+  permissions?: {
+    read?: string[] | { allow?: string[], deny?: string[] },
+    write?: string[] | { allow?: string[], deny?: string[] },
+    net?: string[] | { allow?: string[], deny?: string[] },
+    env?: string[] | { allow?: string[], deny?: string[] },
+    run?: string[] | { allow?: string[], deny?: string[] },
+    sys?: string[] | { allow?: string[], deny?: string[] },
+  },
+
+  annotations?: {
+    readOnlyHint?: boolean,
+    destructiveHint?: boolean,
+    idempotentHint?: boolean,
+    openWorldHint?: boolean,
+  },
+};
+```
+
+| Field | Role |
+| --- | --- |
+| `name` | MCP tool name. If omitted, defaults to the file stem. |
+| `description` | Exposed to the LLM; explain what the tool does and when to use it. |
+| `inputSchema` | JSON Schema for arguments passed to `run()`. The host validates `args` against this before invocation. |
+| `outputSchema` | Optional JSON Schema for the structured value returned by `run()`. |
+| `permissions` | Deno capabilities requested by the script. The host may restrict or reject these according to its policy. |
+| `annotations` | Standard MCP tool behavior hints. |
+| `run(args)` | Implements the tool. May be `async`. A string return becomes MCP text content; any other JSON value is returned as structured content. |
 
 ### Permissions
 
@@ -135,7 +179,41 @@ Deno runs with `--no-prompt`. By default a script may only read the scripts dire
 
 - `--allow-all` on the CLI
 - `--deno-arg=--allow-env` (repeatable)
-- a `permissions` export on the script: `"net"`, `"read"`, `"env"`, `"all"`, or a full flag such as `"--allow-read=/tmp"`
+- a `permissions` object on the script
+
+Example:
+
+```ts
+permissions: {
+  read: {
+    allow: ["~/*"],
+    deny: ["~/.ssh/*"],
+  },
+  write: {
+    allow: ["${workspace}/*"],
+    deny: ["${workspace}/.secrets/*"],
+  },
+  net: ["api.github.com"],
+  env: ["GITHUB_TOKEN"],
+  run: ["git"],
+  sys: ["hostname", "osRelease"],
+}
+```
+
+A bare string array is shorthand for `{ allow: [...] }`. The object form lets you grant broad access and carve out exclusions.
+
+These map to Deno flags:
+
+```text
+--allow-read / --deny-read
+--allow-write / --deny-write
+--allow-net / --deny-net
+--allow-env / --deny-env
+--allow-run / --deny-run
+--allow-sys / --deny-sys
+```
+
+`${workspace}` expands to the configured scripts directory. Use `"*"` in an allow or deny list for the unrestricted form of that flag (for example `net: ["*"]` → `--allow-net`). Empty lists grant or deny nothing for that capability.
 
 `console.log` from a script is redirected to stderr so it cannot break MCP JSON.
 
@@ -143,4 +221,5 @@ Deno runs with `--no-prompt`. By default a script may only read the scripts dire
 
 - `src/` — Rust MCP frontend (`rmcp` over Streamable HTTP and stdio)
 - `runtime/host.ts` — Deno loader that introspects and invokes a script
+- `runtime/tool.ts` — TypeScript types for the tool module contract
 - `scripts/` — example tools

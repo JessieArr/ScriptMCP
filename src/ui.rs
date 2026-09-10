@@ -12,15 +12,16 @@ use crate::catalog::Catalog;
 use crate::config::Opts;
 use crate::deno::DenoRuntime;
 use crate::install::{self, sidecar_path, DenoSource, DetectedDeno, InstallProgress};
-use crate::listen;
+use crate::listen::{self, HttpReady};
 use crate::mcp_config::{self, StdioLaunch};
+use crate::server::{ScriptMcp, ToolCallOutcome, ToolCallRecord};
 
 pub fn run(opts: Opts) -> Result<()> {
     let handle = Handle::current();
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([640.0, 860.0])
-            .with_min_inner_size([520.0, 640.0])
+            .with_inner_size([640.0, 980.0])
+            .with_min_inner_size([520.0, 700.0])
             .with_title("ScriptMCP"),
         ..Default::default()
     };
@@ -42,6 +43,7 @@ struct ScriptMcpApp {
     tools_status: String,
     install: InstallUi,
     http: HttpState,
+    recent_calls: Vec<ToolCallRecord>,
     status: String,
 }
 
@@ -70,10 +72,12 @@ enum InstallEvent {
 enum HttpState {
     Stopped,
     Starting {
-        rx: oneshot::Receiver<Result<SocketAddr, String>>,
+        rx: oneshot::Receiver<Result<HttpReady, String>>,
     },
     Listening {
         addr: SocketAddr,
+        server: ScriptMcp,
+        generation: u64,
     },
     Failed(String),
 }
@@ -95,6 +99,7 @@ impl ScriptMcpApp {
             tools_status: String::new(),
             install: InstallUi::Idle,
             http: HttpState::Stopped,
+            recent_calls: Vec::new(),
             status: String::new(),
         };
         app.refresh_tools();
@@ -118,39 +123,57 @@ impl ScriptMcpApp {
             return;
         }
         self.tools_status = "Scanning scripts…".into();
-        let opts = self.opts.clone();
         let handle = self.rt.clone();
-        let result = thread::spawn(move || {
-            handle.block_on(async {
-                let runtime = DenoRuntime::new(&opts).await?;
-                Catalog::load(&opts, &runtime).await
+        let result = if let HttpState::Listening { server, .. } = &self.http {
+            let server = server.clone();
+            let dir = self.opts.scripts.clone();
+            thread::spawn(move || handle.block_on(async { server.set_scripts_dir(dir).await }))
+                .join()
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("script scan thread panicked")))
+        } else {
+            let opts = self.opts.clone();
+            thread::spawn(move || {
+                handle.block_on(async {
+                    let runtime = DenoRuntime::new(&opts).await?;
+                    Catalog::load(&opts.scripts, &runtime).await
+                })
             })
-        })
-        .join()
-        .unwrap_or_else(|_| Err(anyhow::anyhow!("script scan thread panicked")));
+            .join()
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("script scan thread panicked")))
+        };
 
         match result {
             Ok(catalog) => {
-                self.tools = catalog
-                    .tools()
-                    .iter()
-                    .map(|tool| ToolRow {
-                        name: tool.meta.name.clone(),
-                        path: tool.path.display().to_string(),
-                        description: tool.meta.description.clone(),
-                    })
-                    .collect();
-                self.tools_status = if self.tools.is_empty() {
-                    format!("No scripts found in {}", self.opts.scripts.display())
-                } else {
-                    format!("{} tool(s)", self.tools.len())
-                };
+                self.apply_catalog(&catalog);
+                if let HttpState::Listening {
+                    server, generation, ..
+                } = &mut self.http
+                {
+                    *generation = server.generation();
+                }
             }
             Err(error) => {
                 self.tools.clear();
                 self.tools_status = error.to_string();
             }
         }
+    }
+
+    fn apply_catalog(&mut self, catalog: &Catalog) {
+        self.tools = catalog
+            .tools()
+            .iter()
+            .map(|tool| ToolRow {
+                name: tool.meta.name.clone(),
+                path: tool.path.display().to_string(),
+                description: tool.meta.description.clone(),
+            })
+            .collect();
+        self.tools_status = if self.tools.is_empty() {
+            format!("No scripts found in {}", self.opts.scripts.display())
+        } else {
+            format!("{} tool(s)", self.tools.len())
+        };
     }
 
     fn start_install(&mut self) {
@@ -247,9 +270,15 @@ impl ScriptMcpApp {
         };
         ctx.request_repaint();
         match rx.try_recv() {
-            Ok(Ok(addr)) => {
-                self.status = format!("MCP HTTP listening on {}", mcp_config::http_url(addr));
-                self.http = HttpState::Listening { addr };
+            Ok(Ok(ready)) => {
+                self.apply_catalog(&ready.server.snapshot());
+                self.recent_calls = ready.server.recent_calls();
+                self.status = format!("MCP HTTP listening on {}", mcp_config::http_url(ready.addr));
+                self.http = HttpState::Listening {
+                    addr: ready.addr,
+                    generation: ready.server.generation(),
+                    server: ready.server,
+                };
             }
             Ok(Err(error)) => {
                 self.http = HttpState::Failed(error);
@@ -257,6 +286,29 @@ impl ScriptMcpApp {
             Err(oneshot::error::TryRecvError::Empty) => {}
             Err(oneshot::error::TryRecvError::Closed) => {
                 self.http = HttpState::Failed("HTTP server exited before binding.".into());
+            }
+        }
+    }
+
+    fn poll_catalog(&mut self, ctx: &egui::Context) {
+        let (current, calls, catalog) = {
+            let HttpState::Listening {
+                server, generation, ..
+            } = &self.http
+            else {
+                return;
+            };
+            ctx.request_repaint_after(std::time::Duration::from_millis(300));
+            let current = server.generation();
+            let calls = server.recent_calls();
+            let catalog = (current != *generation).then(|| server.snapshot());
+            (current, calls, catalog)
+        };
+        self.recent_calls = calls;
+        if let Some(catalog) = catalog {
+            self.apply_catalog(&catalog);
+            if let HttpState::Listening { generation, .. } = &mut self.http {
+                *generation = current;
             }
         }
     }
@@ -275,6 +327,7 @@ impl eframe::App for ScriptMcpApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_install(ctx);
         self.poll_http(ctx);
+        self.poll_catalog(ctx);
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(8.0);
@@ -289,6 +342,8 @@ impl eframe::App for ScriptMcpApp {
             scripts_panel(self, ui);
             ui.add_space(12.0);
             tools_panel(self, ui);
+            ui.add_space(12.0);
+            calls_panel(self, ui);
             ui.add_space(12.0);
             mcp_panel(self, ui);
             if !self.status.is_empty() {
@@ -435,6 +490,64 @@ fn tools_panel(app: &ScriptMcpApp, ui: &mut Ui) {
     });
 }
 
+fn calls_panel(app: &ScriptMcpApp, ui: &mut Ui) {
+    ui.push_id("calls_panel", |ui| {
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Recent tool calls").strong());
+                ui.label(RichText::new("last 10").color(ui.visuals().weak_text_color()));
+            });
+            ui.add_space(4.0);
+            if !matches!(app.http, HttpState::Listening { .. }) {
+                ui.label("Start the HTTP server to record tool calls.");
+                return;
+            }
+            if app.recent_calls.is_empty() {
+                ui.label("No tool calls yet.");
+                return;
+            }
+            egui::ScrollArea::vertical()
+                .id_salt("calls_scroll")
+                .max_height(180.0)
+                .show(ui, |ui| {
+                    for (index, call) in app.recent_calls.iter().enumerate() {
+                        ui.push_id(index, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.small(call.clock());
+                                ui.strong(&call.name);
+                                match &call.outcome {
+                                    ToolCallOutcome::Success { .. } => {
+                                        ui.colored_label(Color32::from_rgb(80, 170, 110), "ok");
+                                    }
+                                    ToolCallOutcome::Error { .. } => {
+                                        ui.colored_label(Color32::from_rgb(210, 90, 80), "error");
+                                    }
+                                    ToolCallOutcome::UnknownTool => {
+                                        ui.colored_label(Color32::from_rgb(210, 90, 80), "unknown");
+                                    }
+                                }
+                            });
+                            ui.small(format!("in  {}", call.arguments));
+                            match &call.outcome {
+                                ToolCallOutcome::Success { preview } => {
+                                    ui.small(format!("out {preview}"));
+                                }
+                                ToolCallOutcome::Error { message } => {
+                                    ui.small(
+                                        RichText::new(format!("out {message}"))
+                                            .color(Color32::from_rgb(210, 90, 80)),
+                                    );
+                                }
+                                ToolCallOutcome::UnknownTool => {}
+                            }
+                            ui.add_space(4.0);
+                        });
+                    }
+                });
+        });
+    });
+}
+
 fn mcp_panel(app: &mut ScriptMcpApp, ui: &mut Ui) {
     ui.push_id("mcp_panel", |ui| {
         ui.group(|ui| {
@@ -474,14 +587,16 @@ fn http_section(app: &mut ScriptMcpApp, ui: &mut Ui) {
         HttpState::Starting { .. } => {
             ui.label("Binding localhost…");
         }
-        HttpState::Listening { addr } => {
+        HttpState::Listening { addr, .. } => {
             ui.horizontal(|ui| {
                 ui.colored_label(Color32::from_rgb(80, 170, 110), "Listening");
                 ui.monospace(mcp_config::http_url(*addr));
             });
             ui.label(
-                RichText::new("Point an MCP client at this URL. It is not a web page.")
-                    .color(ui.visuals().weak_text_color()),
+                RichText::new(
+                    "Point an MCP client at this URL. Script changes notify connected clients.",
+                )
+                .color(ui.visuals().weak_text_color()),
             );
         }
         HttpState::Failed(error) => {
@@ -493,7 +608,7 @@ fn http_section(app: &mut ScriptMcpApp, ui: &mut Ui) {
     }
 
     let url = match &app.http {
-        HttpState::Listening { addr } => mcp_config::http_url(*addr),
+        HttpState::Listening { addr, .. } => mcp_config::http_url(*addr),
         _ => match app.opts.socket_addr() {
             Ok(addr) => mcp_config::http_url(addr),
             Err(_) => format!("http://{}/mcp", app.opts.bind),

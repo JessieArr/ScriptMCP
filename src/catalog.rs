@@ -6,43 +6,73 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tracing::{info, warn};
 
-use crate::config::Opts;
 use crate::deno::DenoRuntime;
+use crate::permissions::ScriptPermissions;
 
 const SCRIPT_EXTENSIONS: &[&str] = &["ts", "js", "mts", "mjs"];
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScriptAnnotations {
+    #[serde(default, rename = "readOnlyHint")]
+    pub read_only_hint: Option<bool>,
+    #[serde(default, rename = "destructiveHint")]
+    pub destructive_hint: Option<bool>,
+    #[serde(default, rename = "idempotentHint")]
+    pub idempotent_hint: Option<bool>,
+    #[serde(default, rename = "openWorldHint")]
+    pub open_world_hint: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScriptMeta {
     pub name: String,
     #[serde(default)]
     pub description: String,
     #[serde(default = "empty_schema", rename = "inputSchema")]
     pub input_schema: Value,
+    #[serde(default, rename = "outputSchema")]
+    pub output_schema: Option<Value>,
     #[serde(default)]
-    pub permissions: Vec<String>,
+    pub permissions: ScriptPermissions,
+    #[serde(default)]
+    pub annotations: Option<ScriptAnnotations>,
 }
 
 fn empty_schema() -> Value {
     serde_json::json!({ "type": "object", "properties": {} })
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ScriptTool {
     pub meta: ScriptMeta,
     pub path: PathBuf,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Catalog {
     tools: Vec<ScriptTool>,
 }
 
+pub fn resolve_scripts_dir(path: &Path) -> Result<PathBuf> {
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+    joined
+        .canonicalize()
+        .with_context(|| format!("scripts directory not found: {}", path.display()))
+}
+
 impl Catalog {
-    pub async fn load(opts: &Opts, runtime: &DenoRuntime) -> Result<Self> {
-        let scripts_dir = opts
-            .scripts
-            .canonicalize()
-            .with_context(|| format!("scripts directory not found: {}", opts.scripts.display()))?;
+    pub async fn load(scripts_dir: &Path, runtime: &DenoRuntime) -> Result<Self> {
+        let scripts_dir = if scripts_dir.is_absolute() {
+            scripts_dir.to_path_buf()
+        } else {
+            resolve_scripts_dir(scripts_dir)?
+        };
 
         if !scripts_dir.is_dir() {
             anyhow::bail!("scripts path is not a directory: {}", scripts_dir.display());
@@ -108,25 +138,39 @@ pub fn list_script_files(dir: &Path) -> Result<Vec<PathBuf>> {
 
     for entry in entries {
         let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if name.starts_with('.') || name.starts_with('_') {
-            continue;
-        }
-        if !path.is_file() {
-            continue;
-        }
-        let ext = path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        if SCRIPT_EXTENSIONS.contains(&ext.as_str()) {
+        if is_script_path(&path) && path.is_file() {
             files.push(path);
         }
     }
     Ok(files)
+}
+
+pub fn is_script_path(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    if name.starts_with('.') || name.starts_with('_') {
+        return false;
+    }
+    let ext = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    SCRIPT_EXTENSIONS.contains(&ext.as_str())
+}
+
+/// True when a filesystem event on `path` might change the tool catalog.
+pub fn should_reload_for_paths(scripts_dir: &Path, paths: &[PathBuf]) -> bool {
+    if paths.is_empty() {
+        return true;
+    }
+    paths.iter().any(|path| {
+        if path == scripts_dir {
+            return true;
+        }
+        path.parent().is_some_and(|parent| parent == scripts_dir) && is_script_path(path)
+    })
 }
 
 pub fn sanitize_tool_name(name: &str) -> String {
@@ -168,5 +212,19 @@ mod tests {
             .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
             .collect();
         assert_eq!(names, vec!["echo.js", "hello.ts"]);
+    }
+
+    #[test]
+    fn reloads_for_script_events_in_the_scripts_dir() {
+        let dir = PathBuf::from("/tmp/scriptmcp-tools");
+        assert!(should_reload_for_paths(&dir, &[dir.join("hello.ts")]));
+        assert!(should_reload_for_paths(&dir, std::slice::from_ref(&dir)));
+        assert!(should_reload_for_paths(&dir, &[]));
+        assert!(!should_reload_for_paths(&dir, &[dir.join("_helper.ts")]));
+        assert!(!should_reload_for_paths(&dir, &[dir.join("readme.md")]));
+        assert!(!should_reload_for_paths(
+            &dir,
+            &[PathBuf::from("/elsewhere/hello.ts")]
+        ));
     }
 }

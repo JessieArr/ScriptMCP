@@ -1,16 +1,17 @@
-export const name = "hello";
-export const description = "Greet someone by name.";
-export const inputSchema = {
-  type: "object",
-  properties: {
-    name: {
-      type: "string",
-      description: "Name to greet",
+export default {
+  name: "hello",
+  description: "Greet someone by name.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      name: {
+        type: "string",
+        description: "Name to greet",
+      },
     },
+    required: ["name"],
   },
-  required: ["name"],
+  async run(args: { name: string }) {
+    return `Hello, ${args.name}!`;
+  },
 };
-
-export default function hello({ name }: { name: string }): string {
-  return `Hello, ${name}!`;
-}
