@@ -70,22 +70,34 @@ fn install_deno() -> Result<()> {
 }
 
 async fn list_tools(opts: &Opts) -> Result<()> {
+    use scriptmcp::app_state::AppState;
     use scriptmcp::catalog::Catalog;
     use scriptmcp::deno::DenoRuntime;
 
+    let state = AppState::load();
+    let folders = state.folders_or_fallback(&opts.scripts);
     let runtime = DenoRuntime::new(opts).await?;
-    let catalog = Catalog::load(&opts.scripts, &runtime).await?;
+    let catalog = Catalog::load_dirs(&folders, &runtime, Some(&state)).await?;
     if catalog.tools().is_empty() {
-        println!("No scripts found in {}", opts.scripts.display());
+        println!("No scripts found in {}", folders_display(&folders));
         return Ok(());
     }
     for tool in catalog.tools() {
+        let mark = if tool.enabled { "*" } else { " " };
         println!(
-            "{}\t{}\t{}",
+            "{mark}\t{}\t{}\t{}",
             tool.meta.name,
             tool.path.display(),
             tool.meta.description
         );
     }
     Ok(())
+}
+
+fn folders_display(folders: &[std::path::PathBuf]) -> String {
+    folders
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }

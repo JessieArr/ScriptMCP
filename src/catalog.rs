@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tracing::{info, warn};
 
+use crate::app_state::AppState;
 use crate::deno::DenoRuntime;
 use crate::permissions::ScriptPermissions;
 
@@ -46,6 +47,9 @@ fn empty_schema() -> Value {
 pub struct ScriptTool {
     pub meta: ScriptMeta,
     pub path: PathBuf,
+    pub source_dir: PathBuf,
+    /// Whether this tool is currently exposed over MCP.
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -66,47 +70,76 @@ pub fn resolve_scripts_dir(path: &Path) -> Result<PathBuf> {
         .with_context(|| format!("scripts directory not found: {}", path.display()))
 }
 
+pub fn resolve_scripts_dirs(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut dirs = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for path in paths {
+        let resolved = resolve_scripts_dir(path)?;
+        if seen.insert(resolved.clone()) {
+            dirs.push(resolved);
+        }
+    }
+    if dirs.is_empty() {
+        anyhow::bail!("no scripts directories configured");
+    }
+    Ok(dirs)
+}
+
 impl Catalog {
     pub async fn load(scripts_dir: &Path, runtime: &DenoRuntime) -> Result<Self> {
-        let scripts_dir = if scripts_dir.is_absolute() {
-            scripts_dir.to_path_buf()
-        } else {
-            resolve_scripts_dir(scripts_dir)?
-        };
+        Self::load_dirs(std::slice::from_ref(&scripts_dir.to_path_buf()), runtime, None).await
+    }
 
-        if !scripts_dir.is_dir() {
-            anyhow::bail!("scripts path is not a directory: {}", scripts_dir.display());
-        }
-
+    pub async fn load_dirs(
+        scripts_dirs: &[PathBuf],
+        runtime: &DenoRuntime,
+        state: Option<&AppState>,
+    ) -> Result<Self> {
+        let dirs = resolve_scripts_dirs(scripts_dirs)?;
         let mut tools = Vec::new();
-        let mut names = HashSet::new();
 
-        for path in list_script_files(&scripts_dir)? {
-            match runtime.introspect(&path).await {
-                Ok(mut meta) => {
-                    meta.name = sanitize_tool_name(&meta.name);
-                    if meta.name.is_empty() {
-                        warn!(path = %path.display(), "skipping script with empty tool name");
-                        continue;
+        for scripts_dir in &dirs {
+            if !scripts_dir.is_dir() {
+                warn!(
+                    path = %scripts_dir.display(),
+                    "skipping scripts path that is not a directory"
+                );
+                continue;
+            }
+
+            for path in list_script_files(scripts_dir)? {
+                match runtime.introspect(&path).await {
+                    Ok(mut meta) => {
+                        meta.name = sanitize_tool_name(&meta.name);
+                        if meta.name.is_empty() {
+                            warn!(path = %path.display(), "skipping script with empty tool name");
+                            continue;
+                        }
+                        info!(name = %meta.name, path = %path.display(), "discovered script tool");
+                        tools.push(ScriptTool {
+                            meta,
+                            path,
+                            source_dir: scripts_dir.clone(),
+                            enabled: true,
+                        });
                     }
-                    if !names.insert(meta.name.clone()) {
-                        warn!(
-                            name = %meta.name,
-                            path = %path.display(),
-                            "skipping script because the tool name is already registered"
-                        );
-                        continue;
+                    Err(error) => {
+                        warn!(path = %path.display(), error = %error, "failed to load script");
                     }
-                    info!(name = %meta.name, path = %path.display(), "registered script tool");
-                    tools.push(ScriptTool { meta, path });
-                }
-                Err(error) => {
-                    warn!(path = %path.display(), error = %error, "failed to load script");
                 }
             }
         }
 
-        tools.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
+        // Keep same-name tools adjacent: sort by name, then path.
+        tools.sort_by(|a, b| {
+            a.meta
+                .name
+                .cmp(&b.meta.name)
+                .then_with(|| a.path.cmp(&b.path))
+        });
+
+        apply_enabled_flags(&mut tools, state);
+
         Ok(Self { tools })
     }
 
@@ -114,8 +147,14 @@ impl Catalog {
         &self.tools
     }
 
-    pub fn get(&self, name: &str) -> Option<&ScriptTool> {
-        self.tools.iter().find(|tool| tool.meta.name == name)
+    pub fn enabled_tools(&self) -> impl Iterator<Item = &ScriptTool> {
+        self.tools.iter().filter(|tool| tool.enabled)
+    }
+
+    pub fn get_enabled(&self, name: &str) -> Option<&ScriptTool> {
+        self.tools
+            .iter()
+            .find(|tool| tool.enabled && tool.meta.name == name)
     }
 
     pub fn input_schema_object(schema: &Value) -> Map<String, Value> {
@@ -125,6 +164,56 @@ impl Catalog {
                 Value::Object(map) => map,
                 _ => Map::new(),
             },
+        }
+    }
+}
+
+/// Apply persisted enable flags. Same-name tools are mutually exclusive: at most
+/// one stays enabled. Explicit `true` entries win; otherwise unknown paths
+/// default to enabled and the first candidate in name/path order is kept.
+fn apply_enabled_flags(tools: &mut [ScriptTool], state: Option<&AppState>) {
+    let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+    for (index, tool) in tools.iter().enumerate() {
+        groups
+            .entry(tool.meta.name.clone())
+            .or_default()
+            .push(index);
+    }
+
+    for indices in groups.values() {
+        let explicit_true: Vec<usize> = indices
+            .iter()
+            .copied()
+            .filter(|&index| {
+                state
+                    .and_then(|s| {
+                        s.enabled
+                            .get(&tools[index].path.display().to_string())
+                            .copied()
+                    })
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        let candidates: Vec<usize> = if !explicit_true.is_empty() {
+            explicit_true
+        } else {
+            indices
+                .iter()
+                .copied()
+                .filter(|&index| {
+                    state
+                        .map(|s| s.is_enabled(&tools[index].path, true))
+                        .unwrap_or(true)
+                })
+                .collect()
+        };
+
+        for &index in indices {
+            tools[index].enabled = false;
+        }
+        if let Some(&index) = candidates.first() {
+            tools[index].enabled = true;
         }
     }
 }
@@ -161,15 +250,17 @@ pub fn is_script_path(path: &Path) -> bool {
 }
 
 /// True when a filesystem event on `path` might change the tool catalog.
-pub fn should_reload_for_paths(scripts_dir: &Path, paths: &[PathBuf]) -> bool {
+pub fn should_reload_for_paths(scripts_dirs: &[PathBuf], paths: &[PathBuf]) -> bool {
     if paths.is_empty() {
         return true;
     }
     paths.iter().any(|path| {
-        if path == scripts_dir {
-            return true;
-        }
-        path.parent().is_some_and(|parent| parent == scripts_dir) && is_script_path(path)
+        scripts_dirs.iter().any(|scripts_dir| {
+            if path == scripts_dir {
+                return true;
+            }
+            path.parent().is_some_and(|parent| parent == scripts_dir) && is_script_path(path)
+        })
     })
 }
 
@@ -217,14 +308,52 @@ mod tests {
     #[test]
     fn reloads_for_script_events_in_the_scripts_dir() {
         let dir = PathBuf::from("/tmp/scriptmcp-tools");
-        assert!(should_reload_for_paths(&dir, &[dir.join("hello.ts")]));
-        assert!(should_reload_for_paths(&dir, std::slice::from_ref(&dir)));
-        assert!(should_reload_for_paths(&dir, &[]));
-        assert!(!should_reload_for_paths(&dir, &[dir.join("_helper.ts")]));
-        assert!(!should_reload_for_paths(&dir, &[dir.join("readme.md")]));
+        let dirs = vec![dir.clone()];
+        assert!(should_reload_for_paths(&dirs, &[dir.join("hello.ts")]));
+        assert!(should_reload_for_paths(&dirs, std::slice::from_ref(&dir)));
+        assert!(should_reload_for_paths(&dirs, &[]));
+        assert!(!should_reload_for_paths(&dirs, &[dir.join("_helper.ts")]));
+        assert!(!should_reload_for_paths(&dirs, &[dir.join("readme.md")]));
         assert!(!should_reload_for_paths(
-            &dir,
+            &dirs,
             &[PathBuf::from("/elsewhere/hello.ts")]
         ));
+    }
+
+    #[test]
+    fn apply_enabled_keeps_duplicates_mutually_exclusive() {
+        let mut tools = vec![
+            ScriptTool {
+                meta: ScriptMeta {
+                    name: "hello".into(),
+                    description: "a".into(),
+                    input_schema: empty_schema(),
+                    output_schema: None,
+                    permissions: ScriptPermissions::default(),
+                    annotations: None,
+                },
+                path: PathBuf::from("/a/hello.ts"),
+                source_dir: PathBuf::from("/a"),
+                enabled: true,
+            },
+            ScriptTool {
+                meta: ScriptMeta {
+                    name: "hello".into(),
+                    description: "b".into(),
+                    input_schema: empty_schema(),
+                    output_schema: None,
+                    permissions: ScriptPermissions::default(),
+                    annotations: None,
+                },
+                path: PathBuf::from("/b/hello.ts"),
+                source_dir: PathBuf::from("/b"),
+                enabled: true,
+            },
+        ];
+        let mut state = AppState::default();
+        state.set_enabled(Path::new("/b/hello.ts"), true);
+        apply_enabled_flags(&mut tools, Some(&state));
+        assert!(!tools[0].enabled);
+        assert!(tools[1].enabled);
     }
 }

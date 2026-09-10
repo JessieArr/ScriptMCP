@@ -54,13 +54,14 @@ export default {
     let opts = opts(dir.path().to_path_buf(), deno);
     let runtime = DenoRuntime::new(&opts).await?;
     let catalog = Catalog::load(&opts.scripts, &runtime).await?;
-    let tool = catalog.get("hello").expect("hello tool");
+    let tool = catalog.get_enabled("hello").expect("hello tool");
     assert_eq!(tool.meta.description, "Greet");
 
     let result = runtime
         .invoke(
             &tool.path,
             &ScriptPermissions::default(),
+            dir.path(),
             &json!({ "name": "Ada" }),
         )
         .await?;
@@ -100,6 +101,7 @@ export default {
         .invoke(
             &dir.path().join("hello.ts"),
             &ScriptPermissions::default(),
+            dir.path(),
             &json!({}),
         )
         .await
@@ -161,7 +163,7 @@ export default {
     let none = ScriptPermissions::default();
 
     let err = runtime
-        .invoke(&dir.path().join("boom.ts"), &none, &json!({}))
+        .invoke(&dir.path().join("boom.ts"), &none, dir.path(), &json!({}))
         .await
         .expect_err("thrown TypeError should fail invoke");
     let message = err.to_string();
@@ -175,7 +177,7 @@ export default {
     );
 
     let err = runtime
-        .invoke(&dir.path().join("reject.ts"), &none, &json!({}))
+        .invoke(&dir.path().join("reject.ts"), &none, dir.path(), &json!({}))
         .await
         .expect_err("rejected promise should fail invoke");
     let message = err.to_string();
@@ -185,7 +187,12 @@ export default {
     );
 
     let err = runtime
-        .invoke(&dir.path().join("string_throw.ts"), &none, &json!({}))
+        .invoke(
+            &dir.path().join("string_throw.ts"),
+            &none,
+            dir.path(),
+            &json!({}),
+        )
         .await
         .expect_err("thrown string should fail invoke");
     assert!(

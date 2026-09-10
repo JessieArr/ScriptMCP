@@ -8,6 +8,7 @@ use eframe::egui::{self, Color32, RichText, Ui};
 use tokio::runtime::Handle;
 use tokio::sync::oneshot;
 
+use crate::app_state::{normalize_path, AppState};
 use crate::catalog::Catalog;
 use crate::config::Opts;
 use crate::deno::DenoRuntime;
@@ -20,8 +21,8 @@ pub fn run(opts: Opts) -> Result<()> {
     let handle = Handle::current();
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([640.0, 980.0])
-            .with_min_inner_size([520.0, 700.0])
+            .with_inner_size([980.0, 820.0])
+            .with_min_inner_size([780.0, 640.0])
             .with_title("ScriptMCP"),
         ..Default::default()
     };
@@ -36,7 +37,8 @@ pub fn run(opts: Opts) -> Result<()> {
 struct ScriptMcpApp {
     opts: Opts,
     rt: Handle,
-    scripts: String,
+    state: AppState,
+    folders: Vec<PathBuf>,
     deno: Option<DetectedDeno>,
     sidecar: String,
     tools: Vec<ToolRow>,
@@ -49,8 +51,11 @@ struct ScriptMcpApp {
 
 struct ToolRow {
     name: String,
-    path: String,
+    path: PathBuf,
+    path_label: String,
     description: String,
+    enabled: bool,
+    conflict: bool,
 }
 
 enum InstallUi {
@@ -84,7 +89,16 @@ enum HttpState {
 
 impl ScriptMcpApp {
     fn new(opts: Opts, rt: Handle) -> Self {
-        let scripts = opts.scripts.display().to_string();
+        let mut state = AppState::load();
+        if state.folders.is_empty() {
+            state.add_folder(opts.scripts.clone());
+            let _ = state.save();
+        }
+        let folders = state
+            .folders
+            .iter()
+            .map(|path| normalize_path(path))
+            .collect();
         let sidecar = sidecar_path()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|_| "(cannot locate executable directory)".into());
@@ -92,7 +106,8 @@ impl ScriptMcpApp {
         let mut app = Self {
             opts,
             rt,
-            scripts,
+            state,
+            folders,
             deno,
             sidecar,
             tools: Vec::new(),
@@ -109,14 +124,42 @@ impl ScriptMcpApp {
         app
     }
 
-    fn refresh_detect(&mut self) {
-        self.opts.scripts = PathBuf::from(self.scripts.trim());
-        self.deno = install::detect(&self.opts.deno);
+    fn persist_folders(&mut self) {
+        self.state.folders = self.folders.clone();
+        if let Err(error) = self.state.save() {
+            self.status = format!("Failed to save config: {error}");
+        }
+    }
+
+    fn add_folder(&mut self, path: PathBuf) {
+        let normalized = normalize_path(&path);
+        if self.folders.iter().any(|existing| existing == &normalized) {
+            self.status = format!("Already added: {}", normalized.display());
+            return;
+        }
+        self.folders.push(normalized.clone());
+        self.state.add_folder(normalized);
+        let _ = self.state.save();
+        self.refresh_tools();
+    }
+
+    fn remove_folder(&mut self, index: usize) {
+        if index >= self.folders.len() {
+            return;
+        }
+        let removed = self.folders.remove(index);
+        self.state.remove_folder(&removed);
+        let _ = self.state.save();
+        if self.folders.is_empty() {
+            let fallback = normalize_path(&self.opts.scripts);
+            self.folders.push(fallback.clone());
+            self.state.add_folder(fallback);
+            let _ = self.state.save();
+        }
         self.refresh_tools();
     }
 
     fn refresh_tools(&mut self) {
-        self.opts.scripts = PathBuf::from(self.scripts.trim());
         if self.deno.is_none() {
             self.tools.clear();
             self.tools_status = "Install Deno to scan scripts.".into();
@@ -124,10 +167,11 @@ impl ScriptMcpApp {
         }
         self.tools_status = "Scanning scripts…".into();
         let handle = self.rt.clone();
+        let folders = self.folders.clone();
+        let state = self.state.clone();
         let result = if let HttpState::Listening { server, .. } = &self.http {
             let server = server.clone();
-            let dir = self.opts.scripts.clone();
-            thread::spawn(move || handle.block_on(async { server.set_scripts_dir(dir).await }))
+            thread::spawn(move || handle.block_on(async { server.set_folders(folders).await }))
                 .join()
                 .unwrap_or_else(|_| Err(anyhow::anyhow!("script scan thread panicked")))
         } else {
@@ -135,7 +179,7 @@ impl ScriptMcpApp {
             thread::spawn(move || {
                 handle.block_on(async {
                     let runtime = DenoRuntime::new(&opts).await?;
-                    Catalog::load(&opts.scripts, &runtime).await
+                    Catalog::load_dirs(&folders, &runtime, Some(&state)).await
                 })
             })
             .join()
@@ -150,6 +194,7 @@ impl ScriptMcpApp {
                 } = &mut self.http
                 {
                     *generation = server.generation();
+                    self.state = server.app_state();
                 }
             }
             Err(error) => {
@@ -159,20 +204,85 @@ impl ScriptMcpApp {
         }
     }
 
+    fn toggle_tool(&mut self, path: PathBuf, enabled: bool) {
+        let handle = self.rt.clone();
+        let result = if let HttpState::Listening { server, .. } = &self.http {
+            let server = server.clone();
+            thread::spawn(move || {
+                handle.block_on(async { server.set_tool_enabled(path, enabled).await })
+            })
+            .join()
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("tool toggle thread panicked")))
+        } else {
+            let name = self
+                .tools
+                .iter()
+                .find(|tool| tool.path == path)
+                .map(|tool| tool.name.clone());
+            if let Some(name) = name {
+                if enabled {
+                    for tool in &self.tools {
+                        if tool.name == name {
+                            self.state.set_enabled(&tool.path, tool.path == path);
+                        }
+                    }
+                } else {
+                    self.state.set_enabled(&path, false);
+                }
+                let _ = self.state.save();
+            }
+            let opts = self.opts.clone();
+            let folders = self.folders.clone();
+            let state = self.state.clone();
+            thread::spawn(move || {
+                handle.block_on(async {
+                    let runtime = DenoRuntime::new(&opts).await?;
+                    Catalog::load_dirs(&folders, &runtime, Some(&state)).await
+                })
+            })
+            .join()
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("tool toggle thread panicked")))
+        };
+
+        match result {
+            Ok(catalog) => {
+                self.apply_catalog(&catalog);
+                if let HttpState::Listening {
+                    server, generation, ..
+                } = &mut self.http
+                {
+                    *generation = server.generation();
+                    self.state = server.app_state();
+                }
+            }
+            Err(error) => {
+                self.status = error.to_string();
+            }
+        }
+    }
+
     fn apply_catalog(&mut self, catalog: &Catalog) {
+        let mut name_counts = std::collections::HashMap::<&str, usize>::new();
+        for tool in catalog.tools() {
+            *name_counts.entry(tool.meta.name.as_str()).or_default() += 1;
+        }
         self.tools = catalog
             .tools()
             .iter()
             .map(|tool| ToolRow {
                 name: tool.meta.name.clone(),
-                path: tool.path.display().to_string(),
+                path: tool.path.clone(),
+                path_label: tool.path.display().to_string(),
                 description: tool.meta.description.clone(),
+                enabled: tool.enabled,
+                conflict: name_counts.get(tool.meta.name.as_str()).copied().unwrap_or(0) > 1,
             })
             .collect();
+        let enabled = self.tools.iter().filter(|tool| tool.enabled).count();
         self.tools_status = if self.tools.is_empty() {
-            format!("No scripts found in {}", self.opts.scripts.display())
+            "No scripts found in the configured folders".into()
         } else {
-            format!("{} tool(s)", self.tools.len())
+            format!("{} tool(s), {} exposed", self.tools.len(), enabled)
         };
     }
 
@@ -201,6 +311,7 @@ impl ScriptMcpApp {
             self.http = HttpState::Failed("Install Deno before starting the HTTP server.".into());
             return;
         }
+        self.persist_folders();
         let (tx, rx) = oneshot::channel();
         let opts = self.opts.clone();
         self.rt.spawn(async move {
@@ -272,6 +383,8 @@ impl ScriptMcpApp {
         match rx.try_recv() {
             Ok(Ok(ready)) => {
                 self.apply_catalog(&ready.server.snapshot());
+                self.state = ready.server.app_state();
+                self.folders = ready.server.folders();
                 self.recent_calls = ready.server.recent_calls();
                 self.status = format!("MCP HTTP listening on {}", mcp_config::http_url(ready.addr));
                 self.http = HttpState::Listening {
@@ -291,7 +404,7 @@ impl ScriptMcpApp {
     }
 
     fn poll_catalog(&mut self, ctx: &egui::Context) {
-        let (current, calls, catalog) = {
+        let (current, calls, catalog, state, folders) = {
             let HttpState::Listening {
                 server, generation, ..
             } = &self.http
@@ -301,12 +414,21 @@ impl ScriptMcpApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(300));
             let current = server.generation();
             let calls = server.recent_calls();
-            let catalog = (current != *generation).then(|| server.snapshot());
-            (current, calls, catalog)
+            let changed = current != *generation;
+            let catalog = changed.then(|| server.snapshot());
+            let state = changed.then(|| server.app_state());
+            let folders = changed.then(|| server.folders());
+            (current, calls, catalog, state, folders)
         };
         self.recent_calls = calls;
         if let Some(catalog) = catalog {
             self.apply_catalog(&catalog);
+            if let Some(state) = state {
+                self.state = state;
+            }
+            if let Some(folders) = folders {
+                self.folders = folders;
+            }
             if let HttpState::Listening { generation, .. } = &mut self.http {
                 *generation = current;
             }
@@ -337,19 +459,38 @@ impl eframe::App for ScriptMcpApp {
                     .color(ui.visuals().weak_text_color()),
             );
             ui.add_space(12.0);
-            deno_panel(self, ui);
-            ui.add_space(12.0);
-            scripts_panel(self, ui);
-            ui.add_space(12.0);
-            tools_panel(self, ui);
-            ui.add_space(12.0);
-            calls_panel(self, ui);
-            ui.add_space(12.0);
-            mcp_panel(self, ui);
-            if !self.status.is_empty() {
-                ui.add_space(8.0);
-                ui.label(RichText::new(&self.status).color(Color32::from_rgb(80, 170, 110)));
-            }
+
+            let available = ui.available_width();
+            let left_width = (available * 0.58).max(420.0);
+            ui.horizontal_top(|ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(left_width, ui.available_height()),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        deno_panel(self, ui);
+                        ui.add_space(12.0);
+                        scripts_panel(self, ui);
+                        ui.add_space(12.0);
+                        tools_panel(self, ui);
+                        ui.add_space(12.0);
+                        mcp_panel(self, ui);
+                        if !self.status.is_empty() {
+                            ui.add_space(8.0);
+                            ui.label(
+                                RichText::new(&self.status).color(Color32::from_rgb(80, 170, 110)),
+                            );
+                        }
+                    },
+                );
+                ui.add_space(12.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), ui.available_height()),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        calls_panel(self, ui);
+                    },
+                );
+            });
         });
     }
 }
@@ -430,62 +571,98 @@ fn deno_panel(app: &mut ScriptMcpApp, ui: &mut Ui) {
 fn scripts_panel(app: &mut ScriptMcpApp, ui: &mut Ui) {
     ui.push_id("scripts_panel", |ui| {
         ui.group(|ui| {
-            ui.label(RichText::new("Scripts directory").strong());
-            ui.add_space(4.0);
             ui.horizontal(|ui| {
-                let response = ui.add(
-                    egui::TextEdit::singleline(&mut app.scripts)
-                        .id_salt("scripts_path")
-                        .desired_width(360.0)
-                        .hint_text("path to TypeScript/JavaScript tools"),
+                ui.label(RichText::new("Script folders").strong());
+                ui.label(
+                    RichText::new(AppState::config_path().display().to_string())
+                        .small()
+                        .color(ui.visuals().weak_text_color()),
                 );
-                if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    app.refresh_detect();
-                }
-                if ui.button("Browse…").clicked() {
+            });
+            ui.add_space(4.0);
+
+            let mut remove_index = None;
+            for (index, folder) in app.folders.iter().enumerate() {
+                ui.push_id(index, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.monospace(folder.display().to_string());
+                        if ui.small_button("Remove").clicked() {
+                            remove_index = Some(index);
+                        }
+                    });
+                });
+            }
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("Add folder…").clicked() {
                     if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                        app.scripts = dir.display().to_string();
-                        app.refresh_detect();
+                        app.add_folder(dir);
                     }
                 }
                 if ui.button("Scan").clicked() {
-                    app.refresh_detect();
+                    app.refresh_tools();
                 }
             });
+
+            if let Some(index) = remove_index {
+                app.remove_folder(index);
+            }
         });
     });
 }
 
-fn tools_panel(app: &ScriptMcpApp, ui: &mut Ui) {
+fn tools_panel(app: &mut ScriptMcpApp, ui: &mut Ui) {
     ui.push_id("tools_panel", |ui| {
         ui.group(|ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Tools").strong());
                 ui.label(RichText::new(&app.tools_status).color(ui.visuals().weak_text_color()));
             });
+            ui.label(
+                RichText::new("Check a tool to expose it over MCP. Duplicate names are mutually exclusive.")
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+            );
             ui.add_space(4.0);
             if app.tools.is_empty() {
                 ui.label("No tools loaded.");
                 return;
             }
+
+            let mut toggle = None;
             egui::ScrollArea::vertical()
                 .id_salt("tools_scroll")
-                .max_height(140.0)
+                .max_height(220.0)
                 .show(ui, |ui| {
-                    for tool in &app.tools {
-                        ui.push_id(&tool.name, |ui| {
+                    for (index, tool) in app.tools.iter().enumerate() {
+                        ui.push_id(index, |ui| {
                             ui.horizontal(|ui| {
+                                let mut enabled = tool.enabled;
+                                if ui.checkbox(&mut enabled, "").changed() {
+                                    toggle = Some((tool.path.clone(), enabled));
+                                }
                                 ui.strong(&tool.name);
+                                if tool.conflict {
+                                    ui.colored_label(
+                                        Color32::from_rgb(180, 140, 60),
+                                        "duplicate",
+                                    );
+                                }
                                 ui.label(
                                     RichText::new(&tool.description)
                                         .color(ui.visuals().weak_text_color()),
                                 );
                             });
-                            ui.small(&tool.path);
+                            ui.small(&tool.path_label);
                             ui.add_space(2.0);
                         });
                     }
                 });
+
+            if let Some((path, enabled)) = toggle {
+                app.toggle_tool(path, enabled);
+            }
         });
     });
 }
@@ -493,8 +670,9 @@ fn tools_panel(app: &ScriptMcpApp, ui: &mut Ui) {
 fn calls_panel(app: &ScriptMcpApp, ui: &mut Ui) {
     ui.push_id("calls_panel", |ui| {
         ui.group(|ui| {
+            ui.set_min_width(280.0);
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Recent tool calls").strong());
+                ui.label(RichText::new("MCP activity").strong());
                 ui.label(RichText::new("last 10").color(ui.visuals().weak_text_color()));
             });
             ui.add_space(4.0);
@@ -508,7 +686,7 @@ fn calls_panel(app: &ScriptMcpApp, ui: &mut Ui) {
             }
             egui::ScrollArea::vertical()
                 .id_salt("calls_scroll")
-                .max_height(180.0)
+                .auto_shrink([false, false])
                 .show(ui, |ui| {
                     for (index, call) in app.recent_calls.iter().enumerate() {
                         ui.push_id(index, |ui| {
@@ -623,8 +801,10 @@ fn http_section(app: &mut ScriptMcpApp, ui: &mut Ui) {
 fn stdio_section(app: &ScriptMcpApp, ui: &mut Ui) {
     ui.label(RichText::new("stdio").strong());
     ui.label(
-        RichText::new("The client launches ScriptMCP and talks over stdin/stdout.")
-            .color(ui.visuals().weak_text_color()),
+        RichText::new(
+            "The client launches ScriptMCP and talks over stdin/stdout. Folders and exposed tools load from the saved config.",
+        )
+        .color(ui.visuals().weak_text_color()),
     );
     let launch = StdioLaunch::from_opts(&app.opts, app.deno.as_ref());
     ui.add_space(4.0);

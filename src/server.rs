@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -19,6 +19,7 @@ use rmcp::{ErrorData as McpError, RoleServer};
 use serde_json::Value;
 use tracing::{error, info, warn};
 
+use crate::app_state::AppState;
 use crate::catalog::{self, Catalog};
 use crate::config::Opts;
 use crate::deno::{DenoRuntime, ScriptError};
@@ -35,12 +36,13 @@ pub struct ScriptMcp {
 
 struct Inner {
     catalog: RwLock<Catalog>,
-    scripts_dir: Arc<RwLock<PathBuf>>,
+    state: Mutex<AppState>,
+    scripts_dirs: Arc<RwLock<Vec<PathBuf>>>,
     runtime: DenoRuntime,
     peers: Mutex<Vec<Peer<RoleServer>>>,
     generation: AtomicU64,
     calls: Mutex<VecDeque<ToolCallRecord>>,
-    dir_tx: tokio::sync::watch::Sender<PathBuf>,
+    dirs_tx: tokio::sync::watch::Sender<Vec<PathBuf>>,
 }
 
 #[derive(Debug, Clone)]
@@ -75,24 +77,34 @@ impl ToolCallRecord {
 
 impl ScriptMcp {
     pub async fn start(opts: &Opts) -> Result<Self> {
-        let resolved = catalog::resolve_scripts_dir(&opts.scripts)?;
-        let scripts_dir = Arc::new(RwLock::new(resolved.clone()));
-        let runtime = DenoRuntime::from_shared_dir(opts, scripts_dir.clone()).await?;
-        let catalog = Catalog::load(&resolved, &runtime).await?;
+        let mut state = AppState::load();
+        if state.folders.is_empty() {
+            state.add_folder(opts.scripts.clone());
+            let _ = state.save();
+        }
+        let folders = state.folders_or_fallback(&opts.scripts);
+        let resolved = catalog::resolve_scripts_dirs(&folders)?;
+        let scripts_dirs = Arc::new(RwLock::new(resolved.clone()));
+        let runtime = DenoRuntime::from_shared_dirs(opts, scripts_dirs.clone()).await?;
+        let catalog = Catalog::load_dirs(&resolved, &runtime, Some(&state)).await?;
+        sync_enabled_into_state(&catalog, &mut state);
+        let _ = state.save();
         info!(
-            scripts = %resolved.display(),
+            folders = resolved.len(),
             tools = catalog.tools().len(),
+            enabled = catalog.enabled_tools().count(),
             "loaded script tools"
         );
-        let (dir_tx, _) = tokio::sync::watch::channel(resolved);
+        let (dirs_tx, _) = tokio::sync::watch::channel(resolved);
         let inner = Arc::new(Inner {
             catalog: RwLock::new(catalog),
-            scripts_dir,
+            state: Mutex::new(state),
+            scripts_dirs,
             runtime,
             peers: Mutex::new(Vec::new()),
             generation: AtomicU64::new(1),
             calls: Mutex::new(VecDeque::new()),
-            dir_tx,
+            dirs_tx,
         });
         spawn_watcher(inner.clone());
         Ok(Self { inner })
@@ -110,17 +122,67 @@ impl ScriptMcp {
             .clone()
     }
 
-    pub async fn set_scripts_dir(&self, path: PathBuf) -> Result<Catalog> {
-        let resolved = catalog::resolve_scripts_dir(&path)?;
+    pub fn app_state(&self) -> AppState {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn folders(&self) -> Vec<PathBuf> {
+        self.inner.scripts_dirs()
+    }
+
+    pub async fn set_folders(&self, folders: Vec<PathBuf>) -> Result<Catalog> {
+        let resolved = catalog::resolve_scripts_dirs(&folders)?;
         {
-            let mut dir = self
+            let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.folders = resolved.clone();
+            state.save()?;
+        }
+        {
+            let mut dirs = self
                 .inner
-                .scripts_dir
+                .scripts_dirs
                 .write()
                 .unwrap_or_else(|e| e.into_inner());
-            *dir = resolved.clone();
+            *dirs = resolved.clone();
         }
-        let _ = self.inner.dir_tx.send(resolved);
+        let _ = self.inner.dirs_tx.send(resolved);
+        self.inner.reload().await?;
+        Ok(self.snapshot())
+    }
+
+    pub async fn set_tool_enabled(&self, path: PathBuf, enabled: bool) -> Result<Catalog> {
+        {
+            let catalog = self
+                .inner
+                .catalog
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            let Some(tool) = catalog.tools().iter().find(|tool| tool.path == path) else {
+                anyhow::bail!("unknown tool path: {}", path.display());
+            };
+            let name = tool.meta.name.clone();
+            let siblings: Vec<PathBuf> = catalog
+                .tools()
+                .iter()
+                .filter(|other| other.meta.name == name)
+                .map(|other| other.path.clone())
+                .collect();
+            drop(catalog);
+
+            let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            if enabled {
+                for sibling in &siblings {
+                    state.set_enabled(sibling, sibling == &path);
+                }
+            } else {
+                state.set_enabled(&path, false);
+            }
+            state.save()?;
+        }
         self.inner.reload().await?;
         Ok(self.snapshot())
     }
@@ -138,8 +200,8 @@ impl ScriptMcp {
 }
 
 impl Inner {
-    fn scripts_dir(&self) -> PathBuf {
-        self.scripts_dir
+    fn scripts_dirs(&self) -> Vec<PathBuf> {
+        self.scripts_dirs
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
@@ -165,14 +227,19 @@ impl Inner {
     }
 
     async fn reload(&self) -> Result<()> {
-        let dir = self.scripts_dir();
-        let catalog = Catalog::load(&dir, &self.runtime)
+        let dirs = self.scripts_dirs();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let catalog = Catalog::load_dirs(&dirs, &self.runtime, Some(&state))
             .await
-            .with_context(|| format!("failed to reload scripts from {}", dir.display()))?;
+            .with_context(|| "failed to reload scripts")?;
+        sync_enabled_into_state(&catalog, &mut state);
+        let _ = state.save();
         let tools = catalog.tools().len();
+        let enabled = catalog.enabled_tools().count();
         *self.catalog.write().unwrap_or_else(|e| e.into_inner()) = catalog;
+        *self.state.lock().unwrap_or_else(|e| e.into_inner()) = state;
         self.generation.fetch_add(1, Ordering::Relaxed);
-        info!(scripts = %dir.display(), tools, "reloaded script tools");
+        info!(folders = dirs.len(), tools, enabled, "reloaded script tools");
         self.broadcast_list_changed().await;
         Ok(())
     }
@@ -187,6 +254,12 @@ impl Inner {
     }
 }
 
+fn sync_enabled_into_state(catalog: &Catalog, state: &mut AppState) {
+    for tool in catalog.tools() {
+        state.set_enabled(&tool.path, tool.enabled);
+    }
+}
+
 fn spawn_watcher(inner: Arc<Inner>) {
     tokio::spawn(async move {
         if let Err(error) = watch_loop(inner).await {
@@ -196,10 +269,10 @@ fn spawn_watcher(inner: Arc<Inner>) {
 }
 
 async fn watch_loop(inner: Arc<Inner>) -> Result<()> {
-    let mut dir_rx = inner.dir_tx.subscribe();
-    dir_rx.mark_unchanged();
+    let mut dirs_rx = inner.dirs_tx.subscribe();
+    dirs_rx.mark_unchanged();
     loop {
-        let dir = inner.scripts_dir();
+        let dirs = inner.scripts_dirs();
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut watcher = RecommendedWatcher::new(
             move |result: notify::Result<Event>| {
@@ -209,14 +282,23 @@ async fn watch_loop(inner: Arc<Inner>) -> Result<()> {
         )
         .context("failed to start script directory watcher")?;
 
-        if let Err(error) = watcher.watch(&dir, RecursiveMode::NonRecursive) {
-            warn!(
-                path = %dir.display(),
-                error = %error,
-                "could not watch scripts directory"
-            );
+        let mut watching = false;
+        for dir in &dirs {
+            if let Err(error) = watcher.watch(dir, RecursiveMode::NonRecursive) {
+                warn!(
+                    path = %dir.display(),
+                    error = %error,
+                    "could not watch scripts directory"
+                );
+            } else {
+                watching = true;
+                info!(path = %dir.display(), "watching scripts directory");
+            }
+        }
+
+        if !watching {
             tokio::select! {
-                changed = dir_rx.changed() => {
+                changed = dirs_rx.changed() => {
                     if changed.is_err() {
                         return Ok(());
                     }
@@ -226,10 +308,9 @@ async fn watch_loop(inner: Arc<Inner>) -> Result<()> {
             continue;
         }
 
-        info!(path = %dir.display(), "watching scripts directory");
         loop {
             tokio::select! {
-                changed = dir_rx.changed() => {
+                changed = dirs_rx.changed() => {
                     if changed.is_err() {
                         return Ok(());
                     }
@@ -240,7 +321,7 @@ async fn watch_loop(inner: Arc<Inner>) -> Result<()> {
                         break;
                     };
                     match event {
-                        Ok(event) if event_should_reload(&dir, &event) => {
+                        Ok(event) if event_should_reload(&dirs, &event) => {
                             tokio::time::sleep(RELOAD_DEBOUNCE).await;
                             while event_rx.try_recv().is_ok() {}
                             if let Err(error) = inner.reload().await {
@@ -256,7 +337,7 @@ async fn watch_loop(inner: Arc<Inner>) -> Result<()> {
     }
 }
 
-fn event_should_reload(scripts_dir: &Path, event: &Event) -> bool {
+fn event_should_reload(scripts_dirs: &[PathBuf], event: &Event) -> bool {
     if event.need_rescan() {
         return true;
     }
@@ -265,12 +346,17 @@ fn event_should_reload(scripts_dir: &Path, event: &Event) -> bool {
         EventKind::Modify(ModifyKind::Metadata(MetadataKind::AccessTime)) => return false,
         _ => {}
     }
-    catalog::should_reload_for_paths(scripts_dir, &event.paths)
+    catalog::should_reload_for_paths(scripts_dirs, &event.paths)
 }
 
 impl ServerHandler for ScriptMcp {
     fn get_info(&self) -> ServerInfo {
-        let scripts_dir = self.inner.scripts_dir();
+        let dirs = self.inner.scripts_dirs();
+        let folders = dirs
+            .iter()
+            .map(|dir| dir.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
         ServerInfo::new(
             ServerCapabilities::builder()
                 .enable_tools()
@@ -283,8 +369,7 @@ impl ServerHandler for ScriptMcp {
                 .with_description("Expose Deno scripts as MCP tools"),
         )
         .with_instructions(format!(
-            "Each JavaScript/TypeScript file in {} is an MCP tool. Call a tool to run that script in Deno. Arguments are passed as JSON matching the tool's input schema. The tool list updates when scripts change.",
-            scripts_dir.display()
+            "Each enabled JavaScript/TypeScript file in [{folders}] is an MCP tool. Call a tool to run that script in Deno. Arguments are passed as JSON matching the tool's input schema. The tool list updates when scripts change."
         ))
     }
 
@@ -301,7 +386,7 @@ impl ServerHandler for ScriptMcp {
             .catalog
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .get(name)
+            .get_enabled(name)
             .map(script_to_tool)
     }
 
@@ -317,8 +402,7 @@ impl ServerHandler for ScriptMcp {
                 .catalog
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
-                .tools()
-                .iter()
+                .enabled_tools()
                 .map(script_to_tool)
                 .collect(),
             ..Default::default()
@@ -337,7 +421,7 @@ impl ServerHandler for ScriptMcp {
         };
         let script = {
             let catalog = self.inner.catalog.read().unwrap_or_else(|e| e.into_inner());
-            catalog.get(&name).cloned()
+            catalog.get_enabled(&name).cloned()
         };
         let Some(script) = script else {
             self.inner
@@ -351,7 +435,12 @@ impl ServerHandler for ScriptMcp {
         match self
             .inner
             .runtime
-            .invoke(&script.path, &script.meta.permissions, &arguments)
+            .invoke(
+                &script.path,
+                &script.meta.permissions,
+                &script.source_dir,
+                &arguments,
+            )
             .await
         {
             Ok(value) => {
@@ -443,19 +532,20 @@ mod tests {
     #[test]
     fn ignores_access_events_and_hidden_files() {
         let dir = PathBuf::from("/tmp/scriptmcp-tools");
+        let dirs = vec![dir.clone()];
         let script = Event {
             kind: EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Content)),
             paths: vec![dir.join("hello.ts")],
             attrs: Default::default(),
         };
-        assert!(event_should_reload(&dir, &script));
+        assert!(event_should_reload(&dirs, &script));
 
         let access = Event {
             kind: EventKind::Access(notify::event::AccessKind::Read),
             paths: vec![dir.join("hello.ts")],
             attrs: Default::default(),
         };
-        assert!(!event_should_reload(&dir, &access));
+        assert!(!event_should_reload(&dirs, &access));
     }
 
     #[test]

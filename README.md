@@ -1,6 +1,6 @@
 # ScriptMCP
 
-Rust MCP server that turns a directory of Deno scripts into tools. Any MCP client can connect over **Streamable HTTP** on localhost, or spawn the process and talk **stdio**. Each `tools/call` runs the matching script in Deno.
+Rust MCP server that turns one or more directories of Deno scripts into tools. Any MCP client can connect over **Streamable HTTP** on localhost, or spawn the process and talk **stdio**. Each `tools/call` runs the matching script in Deno.
 
 ## Requirements
 
@@ -9,7 +9,9 @@ Rust MCP server that turns a directory of Deno scripts into tools. Any MCP clien
 
 ## Setup UI
 
-Running `scriptmcp` in a terminal opens a small window that checks for Deno, can install it, scans your scripts folder, starts a localhost HTTP listener, and shows connection details for HTTP and stdio.
+Running `scriptmcp` in a terminal opens a window that checks for Deno, can install it, manages script folders, toggles which tools are exposed, starts a localhost HTTP listener, and shows connection details for HTTP and stdio. MCP activity appears in a column on the right.
+
+Script folders and per-tool expose settings are saved to `~/.config/scriptmcp/config.json` (or `$XDG_CONFIG_HOME/scriptmcp/config.json`) and reloaded on the next start. Duplicate tool names are listed together and are mutually exclusive—only one can be exposed at a time.
 
 The installer downloads the official Deno zip from the `denoland/deno` GitHub releases, verifies the published SHA-256 checksum, and places `deno` in the same directory as the ScriptMCP executable (for `cargo run`, that is `target/debug/`).
 
@@ -32,7 +34,7 @@ MCP has more than one way to talk to a server:
 
 There is also a legacy HTTP+SSE transport in the protocol. ScriptMCP does not implement that; HTTP here is Streamable HTTP on `/mcp`.
 
-The server watches the scripts directory. Adding, editing, or removing a tool file (or choosing a new scripts folder in the UI) reloads the catalog and sends `notifications/tools/list_changed` so clients can refresh schemas.
+The server watches every configured scripts folder. Adding, editing, or removing a tool file (or changing folders / expose checkboxes in the UI) reloads the catalog and sends `notifications/tools/list_changed` so clients can refresh schemas. `serve` and `list` also load folders from the saved config when present; `--scripts` seeds the config on first run.
 
 The default HTTP bind is loopback only (`127.0.0.1:8788`). Override with `--bind` or `SCRIPTMCP_BIND`.
 
@@ -175,7 +177,7 @@ export default {
 
 ### Permissions
 
-Deno runs with `--no-prompt`. By default a script may only read the scripts directory and the embedded host file. Extra rights come from:
+Deno runs with `--no-prompt`. By default a script may only read its configured script folders and the embedded host file. Extra rights come from:
 
 - `--allow-all` on the CLI
 - `--deno-arg=--allow-env` (repeatable)
@@ -213,7 +215,7 @@ These map to Deno flags:
 --allow-sys / --deny-sys
 ```
 
-`${workspace}` expands to the configured scripts directory. Use `"*"` in an allow or deny list for the unrestricted form of that flag (for example `net: ["*"]` → `--allow-net`). Empty lists grant or deny nothing for that capability.
+`${workspace}` expands to that script's source folder. Use `"*"` in an allow or deny list for the unrestricted form of that flag (for example `net: ["*"]` → `--allow-net`). Empty lists grant or deny nothing for that capability.
 
 `console.log` from a script is redirected to stderr so it cannot break MCP JSON.
 
@@ -223,3 +225,4 @@ These map to Deno flags:
 - `runtime/host.ts` — Deno loader that introspects and invokes a script
 - `runtime/tool.ts` — TypeScript types for the tool module contract
 - `scripts/` — example tools
+- `~/.config/scriptmcp/config.json` — persisted folders and tool expose flags

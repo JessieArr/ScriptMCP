@@ -12,6 +12,7 @@ use tokio::process::Command;
 use tokio::time::timeout;
 use tracing::debug;
 
+use crate::app_state::AppState;
 use crate::catalog::ScriptMeta;
 use crate::config::Opts;
 use crate::permissions::{to_deno_flags, ScriptPermissions};
@@ -37,16 +38,23 @@ pub struct DenoRuntime {
     allow_all: bool,
     extra_args: Vec<String>,
     timeout: Duration,
-    scripts_dir: Arc<RwLock<PathBuf>>,
+    scripts_dirs: Arc<RwLock<Vec<PathBuf>>>,
 }
 
 impl DenoRuntime {
     pub async fn new(opts: &Opts) -> Result<Self> {
-        let scripts_dir = crate::catalog::resolve_scripts_dir(&opts.scripts)?;
-        Self::from_shared_dir(opts, Arc::new(RwLock::new(scripts_dir))).await
+        let state = AppState::load();
+        let folders = state.folders_or_fallback(&opts.scripts);
+        let scripts_dirs = crate::catalog::resolve_scripts_dirs(&folders).unwrap_or_else(|_| {
+            vec![crate::catalog::resolve_scripts_dir(&opts.scripts).unwrap_or(opts.scripts.clone())]
+        });
+        Self::from_shared_dirs(opts, Arc::new(RwLock::new(scripts_dirs))).await
     }
 
-    pub async fn from_shared_dir(opts: &Opts, scripts_dir: Arc<RwLock<PathBuf>>) -> Result<Self> {
+    pub async fn from_shared_dirs(
+        opts: &Opts,
+        scripts_dirs: Arc<RwLock<Vec<PathBuf>>>,
+    ) -> Result<Self> {
         let deno = crate::install::resolve_deno(&opts.deno);
         check_deno(&deno).await?;
         let host = write_host_script()?;
@@ -56,13 +64,23 @@ impl DenoRuntime {
             allow_all: opts.allow_all,
             extra_args: opts.deno_args.clone(),
             timeout: opts.timeout_duration(),
-            scripts_dir,
+            scripts_dirs,
         })
     }
 
     pub async fn introspect(&self, script: &Path) -> Result<ScriptMeta> {
+        let workspace = script
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
         let output = self
-            .run_host("introspect", script, &ScriptPermissions::default(), None)
+            .run_host(
+                "introspect",
+                script,
+                &ScriptPermissions::default(),
+                &workspace,
+                None,
+            )
             .await
             .with_context(|| format!("introspect {}", script.display()))?;
         let meta: ScriptMeta = serde_json::from_value(output)
@@ -74,11 +92,12 @@ impl DenoRuntime {
         &self,
         script: &Path,
         permissions: &ScriptPermissions,
+        workspace: &Path,
         arguments: &Value,
     ) -> Result<Value> {
         let payload = serde_json::to_vec(arguments)?;
         let output = self
-            .run_host("invoke", script, permissions, Some(&payload))
+            .run_host("invoke", script, permissions, workspace, Some(&payload))
             .await?;
         if output.get("ok").and_then(Value::as_bool) == Some(true) {
             return Ok(output.get("result").cloned().unwrap_or(Value::Null));
@@ -91,20 +110,16 @@ impl DenoRuntime {
         command: &str,
         script: &Path,
         permissions: &ScriptPermissions,
+        workspace: &Path,
         stdin: Option<&[u8]>,
     ) -> Result<Value> {
-        let workspace = self
-            .scripts_dir
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
         let mut cmd = Command::new(&self.deno);
         cmd.arg("run")
             .arg("--no-prompt")
             .arg("--quiet")
             .args(self.base_permissions())
             .args(self.extra_args.iter())
-            .args(to_deno_flags(permissions, &workspace))
+            .args(to_deno_flags(permissions, workspace))
             .arg(&self.host)
             .arg(command)
             .arg(script)
@@ -175,16 +190,17 @@ impl DenoRuntime {
         if self.allow_all {
             return vec!["--allow-all".to_string()];
         }
-        vec![
-            format!(
-                "--allow-read={}",
-                self.scripts_dir
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .display()
-            ),
-            format!("--allow-read={}", self.host.display()),
-        ]
+        let mut flags = Vec::new();
+        let dirs = self
+            .scripts_dirs
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        for dir in dirs {
+            flags.push(format!("--allow-read={}", dir.display()));
+        }
+        flags.push(format!("--allow-read={}", self.host.display()));
+        flags
     }
 }
 
