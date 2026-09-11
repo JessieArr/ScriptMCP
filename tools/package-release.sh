@@ -22,7 +22,7 @@ versioned zip files to dist/:
 
   dist/scriptmcp-<version>-x86_64-linux.zip
   dist/scriptmcp-<version>-x86_64-windows.zip
-  dist/scriptmcp-<version>-aarch64-macos.zip
+  dist/scriptmcp-<version>-darwin-macos.zip
 
 Each zip contains the executable plus LICENSE.md and README.md.
 
@@ -80,7 +80,7 @@ zip_label() {
     x86_64-pc-windows-gnu|x86_64-pc-windows-msvc) echo x86_64-windows ;;
     aarch64-pc-windows-gnu|aarch64-pc-windows-msvc) echo aarch64-windows ;;
     x86_64-apple-darwin) echo x86_64-macos ;;
-    aarch64-apple-darwin) echo aarch64-macos ;;
+    aarch64-apple-darwin) echo darwin-macos ;;
     *) echo "$1" ;;
   esac
 }
