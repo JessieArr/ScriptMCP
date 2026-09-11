@@ -95,6 +95,17 @@ cargo build --release
 
 The executable is `target/release/scriptmcp`. After `scriptmcp install-deno` (or the UI button), Deno lives beside that binary and is picked up automatically. Release builds use thin LTO and strip debug symbols.
 
+### Release packages
+
+`tools/package-release.sh` builds a release binary for every desktop target this machine can link, then writes versioned zip files to `dist/`:
+
+```text
+dist/scriptmcp-0.1.0-x86_64-linux.zip
+dist/scriptmcp-0.1.0-x86_64-windows.zip
+```
+
+Each zip contains the executable, `LICENSE.md`, and `README.md`. Linux is native-only (one zip). Windows is a single binary—MSVC when building on Windows, mingw-w64 when cross-compiling. macOS zips are produced on a Mac (or with osxcross). Use `--native-only` to skip cross-compilation.
+
 ## Writing a tool
 
 Each MCP tool is a TypeScript (or JavaScript) module that **default-exports a plain object**. Files that start with `_` or `.` are ignored. The script has no dependency on an MCP SDK.
