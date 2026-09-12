@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -55,9 +55,19 @@ pub struct ToolCallRecord {
 
 #[derive(Debug, Clone)]
 pub enum ToolCallOutcome {
-    Success { preview: String },
+    Success { body: String },
     Error { message: String },
     UnknownTool,
+}
+
+impl ToolCallOutcome {
+    pub fn response_text(&self) -> Option<&str> {
+        match self {
+            Self::Success { body } => Some(body),
+            Self::Error { message } => Some(message),
+            Self::UnknownTool => None,
+        }
+    }
 }
 
 impl ToolCallRecord {
@@ -156,11 +166,7 @@ impl ScriptMcp {
 
     pub async fn set_tool_enabled(&self, path: PathBuf, enabled: bool) -> Result<Catalog> {
         {
-            let catalog = self
-                .inner
-                .catalog
-                .read()
-                .unwrap_or_else(|e| e.into_inner());
+            let catalog = self.inner.catalog.read().unwrap_or_else(|e| e.into_inner());
             let Some(tool) = catalog.tools().iter().find(|tool| tool.path == path) else {
                 anyhow::bail!("unknown tool path: {}", path.display());
             };
@@ -197,6 +203,27 @@ impl ScriptMcp {
             .cloned()
             .collect()
     }
+
+    /// Invoke a catalog script by path. Disabled tools are allowed so the UI can debug them.
+    pub async fn invoke_script(&self, path: &Path, arguments: Value) -> Result<Value> {
+        let script = {
+            let catalog = self.inner.catalog.read().unwrap_or_else(|e| e.into_inner());
+            catalog
+                .tools()
+                .iter()
+                .find(|tool| tool.path == path)
+                .cloned()
+        };
+        let Some(script) = script else {
+            self.inner.record_call(
+                path.display().to_string(),
+                &arguments,
+                ToolCallOutcome::UnknownTool,
+            );
+            anyhow::bail!("unknown tool: {}", path.display());
+        };
+        self.inner.invoke_script(&script, &arguments).await
+    }
 }
 
 impl Inner {
@@ -205,6 +232,51 @@ impl Inner {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    async fn invoke_script(
+        &self,
+        script: &crate::catalog::ScriptTool,
+        arguments: &Value,
+    ) -> Result<Value> {
+        let name = script.meta.name.clone();
+        match self
+            .runtime
+            .invoke(
+                &script.path,
+                &script.meta.permissions,
+                &script.source_dir,
+                arguments,
+            )
+            .await
+        {
+            Ok(value) => {
+                self.record_call(
+                    name,
+                    arguments,
+                    ToolCallOutcome::Success {
+                        body: format_logged_value(&value),
+                    },
+                );
+                Ok(value)
+            }
+            Err(error) => {
+                let message = error.to_string();
+                if error.downcast_ref::<ScriptError>().is_some() {
+                    warn!(tool = %name, error = %message, "script threw");
+                } else {
+                    error!(tool = %name, error = %error, "script tool failed");
+                }
+                self.record_call(
+                    name,
+                    arguments,
+                    ToolCallOutcome::Error {
+                        message: message.clone(),
+                    },
+                );
+                Err(error)
+            }
+        }
     }
 
     fn record_call(&self, name: String, arguments: &Value, outcome: ToolCallOutcome) {
@@ -239,7 +311,10 @@ impl Inner {
         *self.catalog.write().unwrap_or_else(|e| e.into_inner()) = catalog;
         *self.state.lock().unwrap_or_else(|e| e.into_inner()) = state;
         self.generation.fetch_add(1, Ordering::Relaxed);
-        info!(folders = dirs.len(), tools, enabled, "reloaded script tools");
+        info!(
+            folders = dirs.len(),
+            tools, enabled, "reloaded script tools"
+        );
         self.broadcast_list_changed().await;
         Ok(())
     }
@@ -432,42 +507,10 @@ impl ServerHandler for ScriptMcp {
             ));
         };
 
-        match self
-            .inner
-            .runtime
-            .invoke(
-                &script.path,
-                &script.meta.permissions,
-                &script.source_dir,
-                &arguments,
-            )
-            .await
-        {
-            Ok(value) => {
-                self.inner.record_call(
-                    name,
-                    &arguments,
-                    ToolCallOutcome::Success {
-                        preview: preview_value(&value),
-                    },
-                );
-                Ok(value_to_result(value).into())
-            }
+        match self.inner.invoke_script(&script, &arguments).await {
+            Ok(value) => Ok(value_to_result(value).into()),
             Err(error) => {
-                let message = error.to_string();
-                if error.downcast_ref::<ScriptError>().is_some() {
-                    warn!(tool = %name, error = %message, "script threw");
-                } else {
-                    error!(tool = %name, error = %error, "script tool failed");
-                }
-                self.inner.record_call(
-                    name,
-                    &arguments,
-                    ToolCallOutcome::Error {
-                        message: message.clone(),
-                    },
-                );
-                Ok(CallToolResult::error(vec![ContentBlock::text(message)]).into())
+                Ok(CallToolResult::error(vec![ContentBlock::text(error.to_string())]).into())
             }
         }
     }
@@ -504,10 +547,7 @@ fn push_call(calls: &mut VecDeque<ToolCallRecord>, record: ToolCallRecord) {
 }
 
 fn preview_value(value: &Value) -> String {
-    let raw = match value {
-        Value::String(text) => text.clone(),
-        other => serde_json::to_string(other).unwrap_or_else(|_| "{}".into()),
-    };
+    let raw = format_logged_value(value);
     if raw.chars().count() <= PREVIEW_CHARS {
         raw
     } else {
@@ -515,6 +555,79 @@ fn preview_value(value: &Value) -> String {
         out.push('…');
         out
     }
+}
+
+fn format_logged_value(value: &Value) -> String {
+    format_response_text(value)
+}
+
+/// Human-readable tool output. Strings keep real newlines; objects/arrays are indented.
+pub fn format_response_text(value: &Value) -> String {
+    let mut out = String::new();
+    write_response_text(&mut out, value, 0);
+    out
+}
+
+fn write_response_text(out: &mut String, value: &Value, indent: usize) {
+    match value {
+        Value::Null => out.push_str("null"),
+        Value::Bool(flag) => out.push_str(if *flag { "true" } else { "false" }),
+        Value::Number(number) => out.push_str(&number.to_string()),
+        Value::String(text) => write_multiline(out, text, indent),
+        Value::Array(items) => {
+            if items.is_empty() {
+                out.push_str("[]");
+                return;
+            }
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                out.push('\n');
+                out.push_str(&indent_prefix(indent + 1));
+                write_response_text(out, item, indent + 1);
+                if index + 1 < items.len() {
+                    out.push(',');
+                }
+            }
+            out.push('\n');
+            out.push_str(&indent_prefix(indent));
+            out.push(']');
+        }
+        Value::Object(map) => {
+            if map.is_empty() {
+                out.push_str("{}");
+                return;
+            }
+            out.push('{');
+            for (index, (key, item)) in map.iter().enumerate() {
+                out.push('\n');
+                out.push_str(&indent_prefix(indent + 1));
+                out.push_str(key);
+                out.push_str(": ");
+                write_response_text(out, item, indent + 1);
+                if index + 1 < map.len() {
+                    out.push(',');
+                }
+            }
+            out.push('\n');
+            out.push_str(&indent_prefix(indent));
+            out.push('}');
+        }
+    }
+}
+
+fn write_multiline(out: &mut String, text: &str, indent: usize) {
+    let pad = indent_prefix(indent);
+    for (index, line) in text.split('\n').enumerate() {
+        if index > 0 {
+            out.push('\n');
+            out.push_str(&pad);
+        }
+        out.push_str(line);
+    }
+}
+
+fn indent_prefix(indent: usize) -> String {
+    "  ".repeat(indent)
 }
 
 fn value_to_result(value: Value) -> CallToolResult {
@@ -575,5 +688,14 @@ mod tests {
         let preview = preview_value(&Value::String(long));
         assert!(preview.ends_with('…'));
         assert_eq!(preview.chars().count(), PREVIEW_CHARS + 1);
+    }
+
+    #[test]
+    fn formats_multiline_strings_and_objects() {
+        assert_eq!(format_response_text(&Value::String("a\nb".into())), "a\nb");
+        assert_eq!(
+            format_response_text(&serde_json::json!({"result": "hello\nworld"})),
+            "{\n  result: hello\n  world\n}"
+        );
     }
 }

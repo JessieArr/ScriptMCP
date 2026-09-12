@@ -47,8 +47,8 @@ impl AppState {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
-        let text = serde_json::to_string_pretty(self)
-            .context("failed to serialize ScriptMCP config")?;
+        let text =
+            serde_json::to_string_pretty(self).context("failed to serialize ScriptMCP config")?;
         fs::write(&path, text + "\n")
             .with_context(|| format!("failed to write {}", path.display()))?;
         Ok(())

@@ -9,7 +9,7 @@ Rust MCP server that turns one or more directories of Deno scripts into tools. A
 
 ## Setup UI
 
-Running `scriptmcp` in a terminal opens a window that checks for Deno, can install it, manages script folders, toggles which tools are exposed, starts a localhost HTTP listener, and shows connection details for HTTP and stdio. MCP activity appears in a column on the right.
+Running `scriptmcp` in a terminal opens a window that checks for Deno, can install it, manages script folders, toggles which tools are exposed, starts a localhost HTTP listener, and shows connection details for HTTP and stdio. The window is split into four tabs: Status (Deno and connection info), Tools (folders and the tool list), Debug (invoke a tool with JSON arguments), and History (recent MCP actions).
 
 Script folders and per-tool expose settings are saved to `~/.config/scriptmcp/config.json` (or `$XDG_CONFIG_HOME/scriptmcp/config.json`) and reloaded on the next start. Duplicate tool names are listed together and are mutually exclusive—only one can be exposed at a time.
 

@@ -104,7 +104,13 @@ pub fn to_deno_flags(permissions: &ScriptPermissions, workspace: &Path) -> Vec<S
         ("run", &permissions.run),
         ("sys", &permissions.sys),
     ] {
-        push_flag(&mut flags, "allow", capability, &permission.allow, workspace);
+        push_flag(
+            &mut flags,
+            "allow",
+            capability,
+            &permission.allow,
+            workspace,
+        );
         push_flag(&mut flags, "deny", capability, &permission.deny, workspace);
     }
     flags

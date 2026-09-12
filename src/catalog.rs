@@ -87,7 +87,12 @@ pub fn resolve_scripts_dirs(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
 
 impl Catalog {
     pub async fn load(scripts_dir: &Path, runtime: &DenoRuntime) -> Result<Self> {
-        Self::load_dirs(std::slice::from_ref(&scripts_dir.to_path_buf()), runtime, None).await
+        Self::load_dirs(
+            std::slice::from_ref(&scripts_dir.to_path_buf()),
+            runtime,
+            None,
+        )
+        .await
     }
 
     pub async fn load_dirs(
