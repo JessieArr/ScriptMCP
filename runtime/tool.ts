@@ -49,7 +49,8 @@ export type ScriptTool = {
   /** Optional JSON Schema for the structured value returned by `run()`. */
   outputSchema?: JSONSchema;
   /**
-   * Deno capabilities. Paths may use `${workspace}` (scripts directory).
+   * Deno capabilities. Paths may use `${workspace}` (scripts directory) and
+   * `~` (`$HOME`). A trailing `/*` means that directory and its contents.
    * Use `"*"` for an unrestricted capability flag. Prefer `{ allow, deny }`
    * when you need both grants and exclusions.
    */

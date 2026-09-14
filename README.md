@@ -226,7 +226,7 @@ These map to Deno flags:
 --allow-sys / --deny-sys
 ```
 
-`${workspace}` expands to that script's source folder. Use `"*"` in an allow or deny list for the unrestricted form of that flag (for example `net: ["*"]` → `--allow-net`). Empty lists grant or deny nothing for that capability.
+`${workspace}` expands to that script's source folder. `~` expands to `$HOME`. A trailing `/*` means that directory and its contents (Deno uses path prefixes, not globs). Use `"*"` in an allow or deny list for the unrestricted form of that flag (for example `net: ["*"]` → `--allow-net`). Empty lists grant or deny nothing for that capability.
 
 `console.log` from a script is redirected to stderr so it cannot break MCP JSON.
 

@@ -93,7 +93,11 @@ pub struct ScriptPermissions {
 /// Each non-empty `allow` list becomes `--allow-<capability>`; each non-empty
 /// `deny` list becomes `--deny-<capability>`. Entries equal to `*` request the
 /// unrestricted form of that flag. Other entries are joined with commas after
-/// expanding `${workspace}` to `workspace`.
+/// expanding `${workspace}` to `workspace` and `~` to `$HOME`.
+///
+/// A trailing `/*` or `/**` is stripped. Deno treats permission paths as
+/// prefixes, so `~/docs/*` must become `/home/user/docs` to allow files inside
+/// that directory.
 pub fn to_deno_flags(permissions: &ScriptPermissions, workspace: &Path) -> Vec<String> {
     let mut flags = Vec::new();
     for (capability, permission) in [
@@ -132,7 +136,7 @@ fn push_flag(
     }
     let expanded: Vec<String> = entries
         .iter()
-        .map(|entry| expand_workspace(entry, workspace))
+        .map(|entry| expand_permission_entry(entry, workspace))
         .filter(|entry| !entry.is_empty())
         .collect();
     if expanded.is_empty() {
@@ -141,8 +145,34 @@ fn push_flag(
     flags.push(format!("--{mode}-{capability}={}", expanded.join(",")));
 }
 
-fn expand_workspace(value: &str, workspace: &Path) -> String {
-    value.replace("${workspace}", &workspace.display().to_string())
+fn expand_permission_entry(value: &str, workspace: &Path) -> String {
+    let with_workspace = value.replace("${workspace}", &workspace.display().to_string());
+    normalize_dir_wildcard(&expand_home(&with_workspace))
+}
+
+fn expand_home(value: &str) -> String {
+    let Ok(home) = std::env::var("HOME") else {
+        return value.to_string();
+    };
+    if home.is_empty() {
+        return value.to_string();
+    }
+    let home = home.trim_end_matches('/');
+    if value == "~" {
+        home.to_string()
+    } else if let Some(rest) = value.strip_prefix("~/") {
+        format!("{home}/{rest}")
+    } else {
+        value.to_string()
+    }
+}
+
+fn normalize_dir_wildcard(value: &str) -> String {
+    value
+        .strip_suffix("/**")
+        .or_else(|| value.strip_suffix("/*"))
+        .unwrap_or(value)
+        .to_string()
 }
 
 #[cfg(test)]
@@ -153,6 +183,7 @@ mod tests {
 
     #[test]
     fn maps_scoped_allow_and_deny_permissions() {
+        std::env::set_var("HOME", "/home/user");
         let workspace = PathBuf::from("/proj");
         let permissions = ScriptPermissions {
             read: CapabilityPermission {
@@ -171,10 +202,10 @@ mod tests {
         assert_eq!(
             to_deno_flags(&permissions, &workspace),
             vec![
-                "--allow-read=~/*",
-                "--deny-read=~/.ssh/*",
-                "--allow-write=/proj/*",
-                "--deny-write=/proj/.secrets/*",
+                "--allow-read=/home/user",
+                "--deny-read=/home/user/.ssh",
+                "--allow-write=/proj",
+                "--deny-write=/proj/.secrets",
                 "--allow-net=api.github.com",
                 "--allow-env=GITHUB_TOKEN",
                 "--allow-run=git",
