@@ -18,8 +18,11 @@ The installer downloads the official Deno zip from the `denoland/deno` GitHub re
 ```bash
 cargo run                  # setup UI when stdin is a terminal
 cargo run -- ui
+cargo run -- ui --console  # keep the console and show GUI logs on stderr
 cargo run -- install-deno  # same install, no window
 ```
+
+The GUI does not log to the terminal by default. On Windows it detaches from the console, closing an automatically opened console window (an existing terminal remains open). Use `scriptmcp ui --console` or `scriptmcp --console` to keep the console attached and see logs. Deno subprocesses run without opening their own console windows. Windows may briefly show a console during startup before the GUI detaches.
 
 MCP clients that spawn ScriptMCP with piped stdin still get stdio `serve` by default.
 
@@ -46,7 +49,7 @@ cargo run -- serve --scripts ./scripts              # HTTP on 127.0.0.1:8788
 cargo run -- serve --stdio --scripts ./scripts      # stdin/stdout
 ```
 
-Logs go to stderr so they never mix with stdio MCP traffic.
+CLI/server logs go to stderr so they never mix with stdio MCP traffic. GUI logs are disabled unless `--console` is supplied.
 
 ```bash
 scriptmcp serve --scripts /path/to/scripts
@@ -104,7 +107,23 @@ dist/scriptmcp-0.1.0-x86_64-linux.zip
 dist/scriptmcp-0.1.0-x86_64-windows.zip
 ```
 
-Each zip contains the executable, `LICENSE.md`, and `README.md`. Linux is native-only (one zip). Windows is a single binary—MSVC when building on Windows, mingw-w64 when cross-compiling. macOS zips are produced on a Mac (or with osxcross). Use `--native-only` to skip cross-compilation.
+Each zip contains the executable, `LICENSE.md`, and `README.md`. Linux is native-only (one zip). Windows is a single binary—MSVC when building on Windows, mingw-w64 when cross-compiling. macOS zips also contain `ScriptMCP.app` and are produced on a Mac (or with osxcross). Use `--native-only` to skip cross-compilation.
+
+### macOS: launch without Terminal
+
+Extract the macOS ZIP and open **ScriptMCP.app**, not the standalone `scriptmcp` executable. You can move the app to Applications. The app explicitly launches the setup UI without opening Terminal; the standalone executable remains available for CLI commands and MCP clients.
+
+To see GUI logs, run the standalone executable from an existing terminal:
+
+```bash
+./scriptmcp ui --console
+# Or use the executable inside an installed app:
+/Applications/ScriptMCP.app/Contents/MacOS/scriptmcp ui --console
+```
+
+Building the app bundle requires **no Apple Developer account, certificates, or signing keys**. These packages are not Developer ID signed or notarized, so macOS may block a downloaded app on first launch. If you trust the download, attempt to open it, then use **System Settings → Privacy & Security → Open Anyway** if offered. Organization security policies may prevent this override. Do not disable Gatekeeper globally.
+
+The app and standalone executable share saved configuration, but each looks for a sidecar Deno beside its own executable. Inside the app, that directory is `ScriptMCP.app/Contents/MacOS/`. Deno on `PATH` is also supported; Finder's `PATH` may differ from your shell's.
 
 ## Writing a tool
 

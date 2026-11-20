@@ -10,9 +10,15 @@ use scriptmcp::listen;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    init_tracing();
     let cli = Cli::parse();
-    match cli.command.unwrap_or_else(default_command) {
+    // Resolve this before detaching: FreeConsole changes stdin's terminal status.
+    let command = cli.command.unwrap_or_else(default_command);
+    let console_logging = !matches!(command, Command::Ui) || cli.console;
+    if !console_logging {
+        detach_console();
+    }
+    init_tracing(console_logging);
+    match command {
         Command::Ui => scriptmcp::ui::run(cli.opts),
         Command::List => list_tools(&cli.opts).await,
         Command::Serve { stdio } => {
@@ -34,12 +40,27 @@ fn default_command() -> Command {
     }
 }
 
-fn init_tracing() {
+fn detach_console() {
+    // Detach only this process, never hide the caller's shared terminal window.
+    // Keep the console subsystem so CLI commands and piped MCP handles work normally.
+    #[cfg(windows)]
+    unsafe {
+        windows_sys::Win32::System::Console::FreeConsole();
+    }
+}
+
+fn init_tracing(console_logging: bool) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
+        .with_writer(move || -> Box<dyn std::io::Write + Send> {
+            if console_logging {
+                Box::new(std::io::stderr())
+            } else {
+                Box::new(std::io::sink())
+            }
+        })
         .with_env_filter(filter)
-        .with_ansi(std::io::stderr().is_terminal())
+        .with_ansi(console_logging && std::io::stderr().is_terminal())
         .init();
 }
 

@@ -128,6 +128,10 @@ impl DenoRuntime {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
+        // Deno's output is captured; do not open a console when the GUI is detached.
+        #[cfg(windows)]
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+
         debug!(?cmd, "spawning Deno host");
         let mut child = cmd.spawn().with_context(|| {
             format!(
@@ -205,7 +209,10 @@ impl DenoRuntime {
 }
 
 async fn check_deno(deno: &Path) -> Result<()> {
-    let output = Command::new(deno)
+    let mut cmd = Command::new(deno);
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    let output = cmd
         .arg("--version")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

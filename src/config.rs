@@ -15,6 +15,10 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
 
+    /// Keep the GUI's console attached and write logs to stderr
+    #[arg(long, global = true)]
+    pub console: bool,
+
     #[command(flatten)]
     pub opts: Opts,
 }
@@ -70,6 +74,38 @@ pub enum Command {
     List,
     /// Download Deno into the directory that contains this executable
     InstallDeno,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gui_console_is_opt_in() {
+        for args in [vec!["scriptmcp"], vec!["scriptmcp", "ui"]] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(!cli.console);
+        }
+    }
+
+    #[test]
+    fn console_flag_works_before_or_after_ui() {
+        for args in [
+            vec!["scriptmcp", "--console"],
+            vec!["scriptmcp", "--console", "ui"],
+            vec!["scriptmcp", "ui", "--console"],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(cli.console);
+        }
+    }
+
+    #[test]
+    fn stdio_command_is_unchanged() {
+        let cli = Cli::try_parse_from(["scriptmcp", "serve", "--stdio"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Serve { stdio: true })));
+        assert!(!cli.console);
+    }
 }
 
 impl Opts {

@@ -129,7 +129,13 @@ pub fn detect(explicit: &Path) -> Option<DetectedDeno> {
 }
 
 pub fn probe_version(path: &Path) -> Result<String> {
-    let output = Command::new(path)
+    let mut cmd = Command::new(path);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    let output = cmd
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

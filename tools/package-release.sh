@@ -25,6 +25,8 @@ versioned zip files to dist/:
   dist/scriptmcp-<version>-darwin-macos.zip
 
 Each zip contains the executable plus LICENSE.md and README.md.
+macOS zips also include ScriptMCP.app for launching without Terminal.
+No developer signing keys are required; packages are not notarized.
 
   --native-only   Build only the host OS (skip cross-compilation)
   -h, --help      Show this help
@@ -227,14 +229,17 @@ write_zip() {
   local dest="$2"
   rm -f "$dest"
   if has_cmd zip; then
-    (cd "$src_dir" && zip -9 -q "$dest" ./*)
+    (cd "$src_dir" && zip -9 -q -r "$dest" ./*)
   else
     python3 - "$src_dir" "$dest" <<'PY'
 import os, sys, zipfile
 src, dest = sys.argv[1], sys.argv[2]
 with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as zf:
-    for name in sorted(os.listdir(src)):
-        zf.write(os.path.join(src, name), name)
+    for root, dirs, files in os.walk(src):
+        dirs.sort()
+        for name in sorted(files):
+            path = os.path.join(root, name)
+            zf.write(path, os.path.relpath(path, src))
 PY
   fi
 }
@@ -277,6 +282,14 @@ package_target() {
   cp "$built" "$stage/$bin"
   cp "$ROOT/LICENSE.md" "$stage/LICENSE.md"
   cp "$ROOT/README.md" "$stage/README.md"
+  case "$target" in
+    *-apple-darwin)
+      if ! bash "$ROOT/tools/package-macos-app.sh" "$built" "$stage/ScriptMCP.app" "$VERSION"; then
+        rm -rf "$stage"
+        return 1
+      fi
+      ;;
+  esac
   write_zip "$stage" "$zip_path"
   rm -rf "$stage"
 
